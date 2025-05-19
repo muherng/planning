@@ -2,22 +2,32 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
+import argparse
+from pathlib import Path
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Evaluate Gemma model on shortest path dataset')
+    parser.add_argument('--checkpoint', type=str, default='saved_models/gemma-shortest-path/checkpoint-8200',
+                      help='Path to model checkpoint directory')
+    parser.add_argument('--num_examples', type=int, default=100,
+                      help='Number of examples to evaluate')
+    return parser.parse_args()
 
 # Paths and model config
-model_dir = "gemma-shortest-path/checkpoint-8200"
-data_file = "shortest_paths.jsonl"
+args = parse_args()
+data_file = "shortest_paths_test.jsonl"
 max_length = 512
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Load model and tokenizer
-tokenizer = AutoTokenizer.from_pretrained(model_dir)
-model = AutoModelForCausalLM.from_pretrained(model_dir).to(device)
+print(f"Loading model from checkpoint: {args.checkpoint}")
+tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
+model = AutoModelForCausalLM.from_pretrained(args.checkpoint).to(device)
 model.eval()
 
 # Load test set directly
-test_ds = load_dataset("json", data_files="shortest_paths_test.jsonl")["train"]
-test_ds = test_ds.select(range(100))  # Take only first 100 examples
-#test_ds = test_ds.train_test_split(test_size=0.0001, seed=42)
+test_ds = load_dataset("json", data_files=data_file)["train"]
+test_ds = test_ds.select(range(args.num_examples))  # Take only specified number of examples
 
 SYSTEM = "You are a graph‑reasoning assistant."
 PROMPT = "{input}\n\n### Answer:\n"
