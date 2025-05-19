@@ -11,7 +11,7 @@ from huggingface_hub import login
 import torch
 
 # Login to Hugging Face
-login(token="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")
+login(token="")
 
 # Model and data configuration
 model_id = "google/gemma-2b"  # or "google/gemma-7b" if you have enough resources
