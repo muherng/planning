@@ -18,7 +18,7 @@ class ErrorRateCallback(TrainerCallback):
     def __init__(self, eval_dataset, tokenizer, num_examples=100, eval_steps=100):
         print("Initializing ErrorRateCallback")
         # Format the dataset first, just like in evaluate.py
-        formatted_ds = eval_dataset.map(format_example)
+        formatted_ds = eval_dataset.map(format_eval_example)
         self.eval_dataset = formatted_ds.select(range(num_examples))
         self.tokenizer = tokenizer
         self.num_examples = num_examples
@@ -34,6 +34,7 @@ class ErrorRateCallback(TrainerCallback):
 
     def on_step_end(self, args, state, control, **kwargs):
         print(f"Step end: {state.global_step}")
+        print("self.eval_steps: ", self.eval_steps)
         # Only compute error rate every eval_steps
         if state.global_step % self.eval_steps == 0:
             print(f"Computing error rate at step {state.global_step}")
@@ -122,16 +123,20 @@ gradient_accumulation_steps = 4
 ds = load_dataset("json", data_files="data/shortest_paths_train.jsonl")["train"]
 ds = ds.train_test_split(test_size=0.05, seed=42)
 
+# Keep a copy of the test set before formatting
+test_ds = ds["test"]
+
 SYSTEM = "You are a graph‑reasoning assistant."
 PROMPT = "{input}\n\n### Answer:\n"
 TARGET = "{label}"
 
+# First format the dataset for training
 def format_example(ex):
     return {
         "text": f"<bos>{SYSTEM}\n\n{PROMPT.format(**ex)}{TARGET.format(**ex)}<eos>"
     }
 
-# Format dataset
+# Format dataset for training
 ds = ds.map(format_example, remove_columns=["input", "label"])
 
 # Load tokenizer and model
@@ -166,6 +171,14 @@ def tokenize_function(examples):
 
 ds = ds.map(tokenize_function, batched=True, remove_columns=["text"])
 
+# Create a separate formatted dataset for evaluation
+def format_eval_example(ex):
+    return {
+        "input": ex["input"],
+        "label": ex["label"],
+        "prompt": f"<bos>{SYSTEM}\n\n{PROMPT.format(**ex)}"
+    }
+
 # Training arguments
 training_args = TrainingArguments(
     output_dir=args.output_dir,
@@ -196,7 +209,7 @@ trainer = Trainer(
         tokenizer=tokenizer,
         mlm=False
     ),
-    callbacks=[ErrorRateCallback(ds["test"], tokenizer, num_examples=100, eval_steps=10)]
+    callbacks=[ErrorRateCallback(test_ds, tokenizer, num_examples=10, eval_steps=10)]  # Use the unformatted test set
 )
 print("Trainer created")  # Debug print
 
