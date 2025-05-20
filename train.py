@@ -26,15 +26,10 @@ class ErrorRateCallback(TrainerCallback):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.eval_steps = eval_steps
 
-    #def on_train_begin(self, args, state, control, **kwargs):
-    #    print("Training beginning")
-
-    #def on_step_begin(self, args, state, control, **kwargs):
-    #    print(f"Step beginning: {state.global_step}")
 
     def on_step_end(self, args, state, control, **kwargs):
-        print(f"Step end: {state.global_step}")
-        print("self.eval_steps: ", self.eval_steps)
+        #print(f"Step end: {state.global_step}")
+        #print("self.eval_steps: ", self.eval_steps)
         # Only compute error rate every eval_steps
         if state.global_step % self.eval_steps == 0:
             print(f"Computing error rate at step {state.global_step}")
@@ -182,7 +177,7 @@ def format_eval_example(ex):
 # Training arguments
 training_args = TrainingArguments(
     output_dir=args.output_dir,
-    num_train_epochs=3,
+    num_train_epochs=1,
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
     gradient_accumulation_steps=gradient_accumulation_steps,
@@ -209,7 +204,7 @@ trainer = Trainer(
         tokenizer=tokenizer,
         mlm=False
     ),
-    callbacks=[ErrorRateCallback(test_ds, tokenizer, num_examples=10, eval_steps=10)]  # Use the unformatted test set
+    callbacks=[ErrorRateCallback(test_ds, tokenizer, num_examples=10, eval_steps=500)]  # Use the unformatted test set
 )
 print("Trainer created")  # Debug print
 
