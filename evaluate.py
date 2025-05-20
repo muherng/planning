@@ -11,11 +11,12 @@ def parse_args():
                       help='Path to model checkpoint directory')
     parser.add_argument('--num_examples', type=int, default=100,
                       help='Number of examples to evaluate')
+    parser.add_argument('--data_file', type=str, default='data/shortest_paths_test.jsonl',
+                      help='Path to the test data file')
     return parser.parse_args()
 
 # Paths and model config
 args = parse_args()
-data_file = "shortest_paths_test.jsonl"
 max_length = 512
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -26,7 +27,8 @@ model = AutoModelForCausalLM.from_pretrained(args.checkpoint).to(device)
 model.eval()
 
 # Load test set directly
-test_ds = load_dataset("json", data_files=data_file)["train"]
+print(f"Loading test data from: {args.data_file}")
+test_ds = load_dataset("json", data_files=args.data_file)["train"]
 test_ds = test_ds.select(range(args.num_examples))  # Take only specified number of examples
 
 SYSTEM = "You are a graph‑reasoning assistant."
