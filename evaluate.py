@@ -17,7 +17,8 @@ def parse_args():
 
 # Paths and model config
 args = parse_args()
-max_length = 512
+max_input_length = 384  # Leave room for generation
+max_new_tokens = 128   # Maximum number of new tokens to generate
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Load model and tokenizer
@@ -51,14 +52,14 @@ for ex in tqdm(test_ds, desc="Evaluating"):
     # Prepare input
     input_text = ex["prompt"]
     
-    # Tokenize input
-    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=max_length).to(device)
+    # Tokenize input with shorter max_length
+    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=max_input_length).to(device)
 
     # Generate answer with explicit EOS handling
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
-            max_length=max_length,
+            max_new_tokens=max_new_tokens,  # Use max_new_tokens instead of max_length
             do_sample=False,
             num_beams=1,
             temperature=1.0,

@@ -31,7 +31,9 @@ def encode_example(g):
     s, t = random.sample(nodes, 2)
     edge_txt = ",".join(f"{u}-{v}:{g.edges[u,v]['weight']}"
                         for u,v in g.edges)
-    sp_nodes = nx.shortest_path(g, s, t, weight='weight')
+    # Get all shortest paths and choose the lexicographically smallest one
+    all_paths = list(nx.all_shortest_paths(g, s, t, weight='weight'))
+    sp_nodes = min(all_paths, key=lambda p: [str(x) for x in p])
     sp_len   = nx.shortest_path_length(g, s, t, weight='weight')
     return {
         "input": f"edges: {edge_txt}; start:{s}; goal:{t}",
