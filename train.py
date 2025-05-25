@@ -53,7 +53,7 @@ class ErrorRateCallback(TrainerCallback):
                 with torch.no_grad():
                     generated_ids = model.generate(
                         **inputs,
-                        max_length=self.max_length,
+                        max_new_tokens=512,
                         do_sample=False,
                         num_beams=1,
                         temperature=1.0,
@@ -93,7 +93,7 @@ class ErrorRateCallback(TrainerCallback):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Gemma model on shortest path dataset')
-    parser.add_argument('--checkpoint', type=str, default=None,
+    parser.add_argument('--checkpoint', type=str, default="saved_models/gemma-shortest-path_20250522_203358/checkpoint-5900",
                       help='Path to model checkpoint directory to resume training from')
     parser.add_argument('--output_dir', type=str, default='saved_models/gemma-shortest-path',
                       help='Directory to save model checkpoints')

@@ -8,9 +8,9 @@ def parse_args():
                       help='Maximum number of nodes in generated graphs')
     parser.add_argument('--p', type=float, default=0.4,
                       help='Edge probability for random graph generation')
-    parser.add_argument('--train_samples', type=int, default=47500,
+    parser.add_argument('--train_samples', type=int, default=100000,
                       help='Number of training examples to generate')
-    parser.add_argument('--test_samples', type=int, default=2500,
+    parser.add_argument('--test_samples', type=int, default=100,
                       help='Number of test examples to generate')
     parser.add_argument('--w_range', type=int, nargs=2, default=[1, 9],
                       help='Range for edge weights (min max)')
