@@ -28,9 +28,6 @@ class ErrorRateCallback(TrainerCallback):
 
 
     def on_step_end(self, args, state, control, **kwargs):
-        #print(f"Step end: {state.global_step}")
-        #print("self.eval_steps: ", self.eval_steps)
-        # Only compute error rate every eval_steps
         if state.global_step % self.eval_steps == 0:
             print(f"Computing error rate at step {state.global_step}")
             model = kwargs.get('model')
@@ -84,6 +81,14 @@ class ErrorRateCallback(TrainerCallback):
                     correct += 1
                 total += 1
 
+                # Print example with reasoning for debugging
+                if total <= 3:  # Print first 3 examples
+                    print("\nExample:")
+                    print(f"Input: {ex['input']}")
+                    print(f"Generated reasoning and answer: {generated_text}")
+                    print(f"Ground truth: {gt_answer}")
+                    print(f"Correct: {answer.startswith(gt_answer)}")
+
             error_rate = 1 - (correct / total)
             print(f"\nStep {state.global_step} - Error rate on {self.num_examples} examples: {error_rate:.4f}")
             model.train()  # Set model back to training mode
@@ -121,14 +126,21 @@ ds = ds.train_test_split(test_size=0.05, seed=42)
 # Keep a copy of the test set before formatting
 test_ds = ds["test"]
 
-SYSTEM = "You are a graph‑reasoning assistant."
-PROMPT = "{input}\n\n### Answer:\n"
+SYSTEM = "You are a graph‑reasoning assistant that thinks step by step before answering."
+PROMPT = "{input}\n\nLet's think step by step:\n"
+REASONING = "{reasoning}\n\n### Answer:\n"
 TARGET = "{label}"
 
 # First format the dataset for training
 def format_example(ex):
+    # Generate reasoning based on the input
+    reasoning = f"1. First, I'll analyze the graph structure from the edges: {ex['input'].split(';')[0]}\n"
+    reasoning += f"2. The start node is {ex['input'].split('start:')[1].split(';')[0].strip()} and goal node is {ex['input'].split('goal:')[1].strip()}\n"
+    reasoning += f"3. I'll find the shortest path by considering all possible paths and their weights\n"
+    reasoning += f"4. The shortest path is {ex['label'].split('path:')[1].split(',')[0].strip()} with total length {ex['label'].split('length:')[1].strip()}"
+    
     return {
-        "text": f"<bos>{SYSTEM}\n\n{PROMPT.format(**ex)}{TARGET.format(**ex)}<eos>"
+        "text": f"<bos>{SYSTEM}\n\n{PROMPT.format(**ex)}{reasoning}\n{REASONING.format(reasoning=reasoning)}{TARGET.format(**ex)}<eos>"
     }
 
 # Format dataset for training
