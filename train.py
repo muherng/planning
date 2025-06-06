@@ -100,7 +100,9 @@ class KStepRolloutTrainer(Trainer):
     def __init__(self, *args, k_tokens=20, tokenizer=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.k_tokens = k_tokens
-        self.tokenizer = tokenizer
+        if not isinstance(self.data_collator, CustomDataCollator):
+            raise ValueError("KStepRolloutTrainer requires CustomDataCollator")
+        self.tokenizer = self.data_collator.tokenizer
         
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # Get the input_ids and attention_mask
@@ -223,6 +225,19 @@ class KStepRolloutTrainer(Trainer):
         if return_outputs:
             return outputs.loss, outputs
         return outputs.loss
+
+class CustomDataCollator(DataCollatorForLanguageModeling):
+    def __init__(self, tokenizer, mlm=False):
+        super().__init__(tokenizer=tokenizer, mlm=mlm)
+        self.tokenizer = tokenizer
+
+    def torch_call(self, examples):
+        # Convert examples to tensors
+        batch = {
+            "input_ids": torch.stack([torch.tensor(x["input_ids"]) for x in examples]),
+            "attention_mask": torch.stack([torch.tensor(x["attention_mask"]) for x in examples])
+        }
+        return batch
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Gemma model on shortest path dataset')
@@ -375,12 +390,9 @@ trainer = KStepRolloutTrainer(
     args=training_args,
     train_dataset=ds["train"],
     eval_dataset=ds["test"],
-    data_collator=DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False
-    ),
+    data_collator=CustomDataCollator(tokenizer=tokenizer, mlm=False),
     callbacks=[ErrorRateCallback(test_ds, tokenizer, num_examples=10, eval_steps=500)],
-    k_tokens=20,  # Number of tokens to generate for reasoning
+    k_tokens=1,  # Number of tokens to generate for reasoning
     tokenizer=tokenizer  # Pass tokenizer explicitly
 )
 print("Trainer created")  # Debug print
