@@ -96,9 +96,137 @@ class ErrorRateCallback(TrainerCallback):
     def on_train_end(self, args, state, control, **kwargs):
         print("Training ended")
 
+class KStepRolloutTrainer(Trainer):
+    def __init__(self, *args, k_tokens=20, tokenizer=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.k_tokens = k_tokens
+        self.tokenizer = tokenizer
+        
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Get the input_ids and attention_mask
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+        
+        # Get special token IDs
+        begin_reasoning_id = self.tokenizer.encode(SPECIAL_TOKENS["begin_reasoning_token"])[0]
+        end_reasoning_id = self.tokenizer.encode(SPECIAL_TOKENS["end_reasoning_token"])[0]
+        
+        # Initialize sequences with just the prompts
+        full_sequences = []
+        full_attention_masks = []
+        valid_indices = []
+        
+        batch_size = input_ids.size(0)
+        for i in range(batch_size):
+            # Find the begin_reasoning token position
+            begin_reasoning_pos = torch.where(input_ids[i] == begin_reasoning_id)[0]
+            end_reasoning_pos = torch.where(input_ids[i] == end_reasoning_id)[0]
+            
+            if len(begin_reasoning_pos) == 1 and len(end_reasoning_pos) == 1:
+                # Get question portion (including <bos>)
+                question = input_ids[i, :begin_reasoning_pos[0] + 1]  # Include <begin_reasoning>
+                full_sequences.append(question)
+                full_attention_masks.append(attention_mask[i, :begin_reasoning_pos[0] + 1])
+                valid_indices.append(i)
+        
+        # If no valid sequences, return zero loss with gradients enabled
+        if not valid_indices:
+            print("Warning: No valid sequences in batch!")
+            return torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+        
+        # Generate k tokens for reasoning
+        with torch.no_grad():
+            for i in range(self.k_tokens):
+                # Generate next token for each sequence based on its current state
+                next_tokens = []
+                for j in range(len(full_sequences)):
+                    # Generate next token based on question + all previous reasoning tokens
+                    outputs = model(
+                        input_ids=full_sequences[j].unsqueeze(0),
+                        attention_mask=full_attention_masks[j].unsqueeze(0),
+                    )
+                    next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
+                    next_tokens.append(next_token[0])
+                
+                # Append the new token to each sequence
+                for j in range(len(full_sequences)):
+                    full_sequences[j] = torch.cat([full_sequences[j], next_tokens[j].unsqueeze(-1)], dim=-1)
+                    full_attention_masks[j] = torch.cat([full_attention_masks[j], torch.ones_like(next_tokens[j].unsqueeze(-1))], dim=-1)
+        
+        # Now compute loss only on the target answer portion
+        full_sequences_with_target = []
+        full_attention_masks_with_target = []
+        labels_list = []
+        
+        for i, idx in enumerate(valid_indices):
+            # Get the target answer (after end_reasoning)
+            end_reasoning_pos = torch.where(input_ids[idx] == end_reasoning_id)[0][0]
+            target_answer = input_ids[idx, end_reasoning_pos:-1]  # Exclude <eos>
+            
+            # Create full sequence: question + reasoning + answer
+            full_sequence = torch.cat([
+                full_sequences[i],  # question + reasoning tokens
+                torch.tensor([end_reasoning_id], device=target_answer.device),  # <end_reasoning>
+                target_answer,      # answer
+                torch.tensor([self.tokenizer.eos_token_id], device=target_answer.device),  # <eos>
+            ], dim=0)
+            
+            # Create attention mask
+            full_attention = torch.cat([
+                full_attention_masks[i],  # question + reasoning tokens
+                torch.ones(1, device=target_answer.device),  # <end_reasoning>
+                torch.ones_like(target_answer),  # answer
+                torch.ones(1, device=target_answer.device),  # <eos>
+            ], dim=0)
+            
+            # Create labels where we only compute loss on the target answer portion
+            labels = torch.full_like(full_sequence, -100)
+            reasoning_end = full_sequences[i].size(0) + 1  # +1 for <end_reasoning>
+            labels[reasoning_end:reasoning_end + target_answer.size(0)] = target_answer
+            
+            full_sequences_with_target.append(full_sequence)
+            full_attention_masks_with_target.append(full_attention)
+            labels_list.append(labels)
+        
+        # Pad all sequences to the same length
+        max_len = max(seq.size(0) for seq in full_sequences_with_target)
+        padded_sequences = []
+        padded_masks = []
+        padded_labels = []
+        
+        for i in range(len(full_sequences_with_target)):
+            seq = full_sequences_with_target[i]
+            mask = full_attention_masks_with_target[i]
+            labels = labels_list[i]
+            padding_len = max_len - seq.size(0)
+            if padding_len > 0:
+                # Add padding at the end
+                seq = torch.cat([seq, torch.full((padding_len,), self.tokenizer.pad_token_id, device=seq.device)])
+                mask = torch.cat([mask, torch.zeros(padding_len, device=mask.device)])
+                labels = torch.cat([labels, torch.full((padding_len,), -100, device=labels.device)])
+            padded_sequences.append(seq)
+            padded_masks.append(mask)
+            padded_labels.append(labels)
+        
+        # Stack all sequences and masks
+        full_sequences_with_target = torch.stack(padded_sequences)
+        full_attention_masks_with_target = torch.stack(padded_masks)
+        labels = torch.stack(padded_labels)
+        
+        # Compute loss
+        outputs = model(
+            input_ids=full_sequences_with_target,
+            attention_mask=full_attention_masks_with_target,
+            labels=labels,
+        )
+        
+        if return_outputs:
+            return outputs.loss, outputs
+        return outputs.loss
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Gemma model on shortest path dataset')
-    parser.add_argument('--checkpoint', type=str, default="saved_models/gemma-shortest-path_20250522_203358/checkpoint-5900",
+    parser.add_argument('--checkpoint', type=str, default=None,
                       help='Path to model checkpoint directory to resume training from')
     parser.add_argument('--output_dir', type=str, default='saved_models/gemma-shortest-path',
                       help='Directory to save model checkpoints')
@@ -126,64 +254,99 @@ ds = ds.train_test_split(test_size=0.05, seed=42)
 # Keep a copy of the test set before formatting
 test_ds = ds["test"]
 
-SYSTEM = "You are a graph‑reasoning assistant that thinks step by step before answering."
+SYSTEM = "You are a graph‑reasoning assistant."
 PROMPT = "{input}\n\nLet's think step by step:\n"
-REASONING = "{reasoning}\n\n### Answer:\n"
 TARGET = "{label}"
 
-# First format the dataset for training
+# Add special tokens for our task
+SPECIAL_TOKENS = {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "pad_token": "<pad>",
+    "sep_token": "<sep>",
+    "begin_reasoning_token": "<begin_reasoning>",
+    "end_reasoning_token": "<end_reasoning>"
+}
+
+# Load tokenizer and model
+tokenizer = AutoTokenizer.from_pretrained(
+    model_id if args.checkpoint is None else args.checkpoint,
+    local_files_only=True if args.checkpoint else False
+)
+
+# Add our special tokens
+special_tokens = {
+    "additional_special_tokens": [
+        SPECIAL_TOKENS["sep_token"],
+        SPECIAL_TOKENS["begin_reasoning_token"],
+        SPECIAL_TOKENS["end_reasoning_token"]
+    ]
+}
+tokenizer.add_special_tokens(special_tokens)
+
+# Verify special tokens are unique
+for token_name, token in SPECIAL_TOKENS.items():
+    token_id = tokenizer.encode(token)[0]
+    print(f"{token_name} ID: {token_id}")
+    print(f"{token_name} decoded: {tokenizer.decode([token_id])}")
+
+# Resize model's token embeddings to match new tokenizer
+model = AutoModelForCausalLM.from_pretrained(
+    model_id if args.checkpoint is None else args.checkpoint,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"
+)
+model.resize_token_embeddings(len(tokenizer))
+
 def format_example(ex):
-    # Generate reasoning based on the input
-    reasoning = f"1. First, I'll analyze the graph structure from the edges: {ex['input'].split(';')[0]}\n"
-    reasoning += f"2. The start node is {ex['input'].split('start:')[1].split(';')[0].strip()} and goal node is {ex['input'].split('goal:')[1].strip()}\n"
-    reasoning += f"3. I'll find the shortest path by considering all possible paths and their weights\n"
-    reasoning += f"4. The shortest path is {ex['label'].split('path:')[1].split(',')[0].strip()} with total length {ex['label'].split('length:')[1].strip()}"
+    # Format the basic sequence: question + separator + answer
+    question = f"{SYSTEM}\n\n{PROMPT.format(**ex)}"
+    answer = TARGET.format(**ex)
+    
+    # Tokenize question and answer separately
+    question_tokens = tokenizer.encode(question, add_special_tokens=False)
+    answer_tokens = tokenizer.encode(answer, add_special_tokens=False)
+    
+    # Get special token IDs
+    bos_id = tokenizer.bos_token_id
+    eos_id = tokenizer.eos_token_id
+    begin_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["begin_reasoning_token"])[0]
+    end_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["end_reasoning_token"])[0]
+    
+    # Construct the full sequence with special tokens
+    full_sequence = (
+        [bos_id] +                # <bos>
+        question_tokens +         # question
+        [begin_reasoning_id] +    # <begin_reasoning>
+        [end_reasoning_id] +     # <end_reasoning>
+        answer_tokens +          # answer
+        [eos_id]                # <eos>
+    )
+    
+    # Pad to max_length
+    if len(full_sequence) < max_length:
+        full_sequence = full_sequence + [tokenizer.pad_token_id] * (max_length - len(full_sequence))
+    else:
+        full_sequence = full_sequence[:max_length]
+    
+    # Create attention mask (1 for all real tokens, 0 for padding)
+    attention_mask = [1] * (len(full_sequence) - full_sequence.count(tokenizer.pad_token_id))
+    attention_mask.extend([0] * full_sequence.count(tokenizer.pad_token_id))
     
     return {
-        "text": f"<bos>{SYSTEM}\n\n{PROMPT.format(**ex)}{reasoning}\n{REASONING.format(reasoning=reasoning)}{TARGET.format(**ex)}<eos>"
+        "input_ids": full_sequence,
+        "attention_mask": attention_mask
     }
 
 # Format dataset for training
 ds = ds.map(format_example, remove_columns=["input", "label"])
-
-# Load tokenizer and model
-tokenizer = AutoTokenizer.from_pretrained(model_id if args.checkpoint is None else args.checkpoint)
-tokenizer.pad_token = tokenizer.eos_token
-
-# Load model from checkpoint or pretrained
-if args.checkpoint:
-    print(f"Loading model from checkpoint: {args.checkpoint}")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.checkpoint,
-        torch_dtype=torch.bfloat16,
-        device_map="auto"
-    )
-else:
-    print(f"Loading pretrained model: {model_id}")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.bfloat16,
-        device_map="auto"
-    )
-
-# Tokenize dataset
-def tokenize_function(examples):
-    return tokenizer(
-        examples["text"],
-        padding="max_length",
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt"
-    )
-
-ds = ds.map(tokenize_function, batched=True, remove_columns=["text"])
 
 # Create a separate formatted dataset for evaluation
 def format_eval_example(ex):
     return {
         "input": ex["input"],
         "label": ex["label"],
-        "prompt": f"<bos>{SYSTEM}\n\n{PROMPT.format(**ex)}"
+        "prompt": f"{SYSTEM}\n\n{PROMPT.format(**ex)}"
     }
 
 # Training arguments
@@ -205,9 +368,9 @@ training_args = TrainingArguments(
     save_total_limit=3,
 )
 
-# Initialize trainer with error rate callback
-print("Creating trainer with ErrorRateCallback")  # Debug print
-trainer = Trainer(
+# Initialize trainer with k-token rollout
+print("Creating trainer with KStepRolloutTrainer")
+trainer = KStepRolloutTrainer(
     model=model,
     args=training_args,
     train_dataset=ds["train"],
@@ -216,7 +379,9 @@ trainer = Trainer(
         tokenizer=tokenizer,
         mlm=False
     ),
-    callbacks=[ErrorRateCallback(test_ds, tokenizer, num_examples=10, eval_steps=500)]  # Use the unformatted test set
+    callbacks=[ErrorRateCallback(test_ds, tokenizer, num_examples=10, eval_steps=500)],
+    k_tokens=20,  # Number of tokens to generate for reasoning
+    tokenizer=tokenizer  # Pass tokenizer explicitly
 )
 print("Trainer created")  # Debug print
 
