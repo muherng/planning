@@ -14,6 +14,8 @@ from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
 class ErrorRateCallback(TrainerCallback):
     def __init__(self, eval_dataset, tokenizer, num_examples=100, eval_steps=100):
         print("Initializing ErrorRateCallback")
@@ -102,129 +104,127 @@ class KStepRolloutTrainer(Trainer):
         self.k_tokens = k_tokens
         if not isinstance(self.data_collator, CustomDataCollator):
             raise ValueError("KStepRolloutTrainer requires CustomDataCollator")
-        self.tokenizer = self.data_collator.tokenizer
-        
+        # Ensure tokenizer is available
+        self.tokenizer = tokenizer if tokenizer is not None else self.data_collator.tokenizer
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Get the input_ids and attention_mask
-        input_ids = inputs["input_ids"]
-        attention_mask = inputs["attention_mask"]
+        """
+        A batched and efficient implementation of the k-step rollout loss.
+        """
+        # Get special token IDs from the tokenizer
+        try:
+            begin_reasoning_id = self.tokenizer.additional_special_tokens_ids[
+                self.tokenizer.additional_special_tokens.index("<begin_reasoning>")
+            ]
+            end_reasoning_id = self.tokenizer.additional_special_tokens_ids[
+                self.tokenizer.additional_special_tokens.index("<end_reasoning>")
+            ]
+        except (ValueError, IndexError):
+            # Fallback for older tokenizer versions
+            begin_reasoning_id = self.tokenizer.encode("<begin_reasoning>", add_special_tokens=False)[0]
+            end_reasoning_id = self.tokenizer.encode("<end_reasoning>", add_special_tokens=False)[0]
+
+        # === Stage 1: Prepare a batch of question prompts for generation ===
+        # The input_ids from the dataloader contain the full sequence (q + special_tokens + a).
+        # We must first extract just the question part for each item.
         
-        # Get special token IDs
-        begin_reasoning_id = self.tokenizer.encode(SPECIAL_TOKENS["begin_reasoning_token"])[0]
-        end_reasoning_id = self.tokenizer.encode(SPECIAL_TOKENS["end_reasoning_token"])[0]
-        
-        # Initialize sequences with just the prompts
-        full_sequences = []
-        full_attention_masks = []
-        valid_indices = []
-        
-        batch_size = input_ids.size(0)
-        for i in range(batch_size):
-            # Find the begin_reasoning token position
-            begin_reasoning_pos = torch.where(input_ids[i] == begin_reasoning_id)[0]
-            end_reasoning_pos = torch.where(input_ids[i] == end_reasoning_id)[0]
-            
+        question_ids_list = []
+        answer_ids_list = []
+
+        # This small loop is unavoidable but fast as it's just CPU tensor slicing.
+        for seq_ids in inputs["input_ids"]:
+            # Find the position of the special tokens
+            begin_reasoning_pos = (seq_ids == begin_reasoning_id).nonzero(as_tuple=True)[0]
+            end_reasoning_pos = (seq_ids == end_reasoning_id).nonzero(as_tuple=True)[0]
+
             if len(begin_reasoning_pos) == 1 and len(end_reasoning_pos) == 1:
-                # Get question portion (including <bos>)
-                question = input_ids[i, :begin_reasoning_pos[0] + 1]  # Include <begin_reasoning>
-                full_sequences.append(question)
-                full_attention_masks.append(attention_mask[i, :begin_reasoning_pos[0] + 1])
-                valid_indices.append(i)
-        
-        # If no valid sequences, return zero loss with gradients enabled
-        if not valid_indices:
-            print("Warning: No valid sequences in batch!")
-            return torch.tensor(0.0, device=input_ids.device, requires_grad=True)
-        
-        # Generate k tokens for reasoning
-        with torch.no_grad():
-            for i in range(self.k_tokens):
-                # Generate next token for each sequence based on its current state
-                next_tokens = []
-                for j in range(len(full_sequences)):
-                    # Generate next token based on question + all previous reasoning tokens
-                    outputs = model(
-                        input_ids=full_sequences[j].unsqueeze(0),
-                        attention_mask=full_attention_masks[j].unsqueeze(0),
-                    )
-                    next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
-                    next_tokens.append(next_token[0])
+                # Extract question: from <bos> up to and including <begin_reasoning>
+                question = seq_ids[:begin_reasoning_pos[0] + 1]
+                question_ids_list.append(question)
                 
-                # Append the new token to each sequence
-                for j in range(len(full_sequences)):
-                    full_sequences[j] = torch.cat([full_sequences[j], next_tokens[j].unsqueeze(-1)], dim=-1)
-                    full_attention_masks[j] = torch.cat([full_attention_masks[j], torch.ones_like(next_tokens[j].unsqueeze(-1))], dim=-1)
-        
-        # Now compute loss only on the target answer portion
-        full_sequences_with_target = []
-        full_attention_masks_with_target = []
+                # Extract answer: from after <end_reasoning> up to <eos>
+                # We assume <eos> is the last token before padding.
+                non_pad_tokens = seq_ids[seq_ids != self.tokenizer.pad_token_id]
+                eos_pos = (non_pad_tokens == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+                answer = non_pad_tokens[end_reasoning_pos[0] + 1 : eos_pos[0]]
+                answer_ids_list.append(answer)
+
+        if not question_ids_list:
+            # If the batch contains no valid examples, return zero loss.
+            return torch.tensor(0.0, device=model.device, requires_grad=True)
+
+        # Use the tokenizer's padding utility to create a padded batch of questions.
+        question_batch = self.tokenizer.pad(
+            {"input_ids": question_ids_list},
+            padding=True,
+            return_tensors="pt"
+        ).to(model.device)
+
+        # === Stage 2: Generate reasoning for the entire batch in one call ===
+        with torch.no_grad():
+            generated_sequences = model.generate(
+                input_ids=question_batch["input_ids"],
+                attention_mask=question_batch["attention_mask"],
+                max_new_tokens=self.k_tokens,
+                # Use greedy decoding to match the original logic
+                do_sample=False,
+                num_beams=1,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+
+        # === Stage 3: Combine generated sequences with answers and compute loss ===
+        final_input_ids_list = []
         labels_list = []
-        
-        for i, idx in enumerate(valid_indices):
-            # Get the target answer (after end_reasoning)
-            end_reasoning_pos = torch.where(input_ids[idx] == end_reasoning_id)[0][0]
-            target_answer = input_ids[idx, end_reasoning_pos:-1]  # Exclude <eos>
+
+        for i in range(len(generated_sequences)):
+            # The generated_sequences tensor now contains `question + reasoning`.
+            # We need to find the true end of the sequence before any padding.
+            q_and_r_tokens = generated_sequences[i]
             
-            # Create full sequence: question + reasoning + answer
-            full_sequence = torch.cat([
-                full_sequences[i],  # question + reasoning tokens
-                torch.tensor([end_reasoning_id], device=target_answer.device),  # <end_reasoning>
-                target_answer,      # answer
-                torch.tensor([self.tokenizer.eos_token_id], device=target_answer.device),  # <eos>
-            ], dim=0)
+            # Find where the padding starts
+            pad_start_pos = (q_and_r_tokens == self.tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
+            if len(pad_start_pos) > 0:
+                q_and_r_tokens = q_and_r_tokens[:pad_start_pos[0]] # Trim padding
+
+            answer_tokens = answer_ids_list[i].to(model.device)
+
+            # Construct the final sequence: [question + reasoning] + [<end_reasoning>] + [answer] + [<eos>]
+            final_seq = torch.cat([
+                q_and_r_tokens,
+                torch.tensor([end_reasoning_id], device=model.device, dtype=torch.long),
+                answer_tokens,
+                torch.tensor([self.tokenizer.eos_token_id], device=model.device, dtype=torch.long),
+            ])
+            final_input_ids_list.append(final_seq)
             
-            # Create attention mask
-            full_attention = torch.cat([
-                full_attention_masks[i],  # question + reasoning tokens
-                torch.ones(1, device=target_answer.device),  # <end_reasoning>
-                torch.ones_like(target_answer),  # answer
-                torch.ones(1, device=target_answer.device),  # <eos>
-            ], dim=0)
-            
-            # Create labels where we only compute loss on the target answer portion
-            labels = torch.full_like(full_sequence, -100)
-            reasoning_end = full_sequences[i].size(0) + 1  # +1 for <end_reasoning>
-            labels[reasoning_end:reasoning_end + target_answer.size(0)] = target_answer
-            
-            full_sequences_with_target.append(full_sequence)
-            full_attention_masks_with_target.append(full_attention)
+            # Create the labels tensor, masking everything except the answer.
+            labels = torch.full_like(final_seq, -100)
+            answer_start_index = len(q_and_r_tokens) + 1  # +1 for <end_reasoning>
+            # Shift the answer tokens by one position to the left for next token prediction
+            labels[answer_start_index : answer_start_index + len(answer_tokens) - 1] = answer_tokens[1:]
             labels_list.append(labels)
-        
-        # Pad all sequences to the same length
-        max_len = max(seq.size(0) for seq in full_sequences_with_target)
-        padded_sequences = []
-        padded_masks = []
-        padded_labels = []
-        
-        for i in range(len(full_sequences_with_target)):
-            seq = full_sequences_with_target[i]
-            mask = full_attention_masks_with_target[i]
-            labels = labels_list[i]
-            padding_len = max_len - seq.size(0)
-            if padding_len > 0:
-                # Add padding at the end
-                seq = torch.cat([seq, torch.full((padding_len,), self.tokenizer.pad_token_id, device=seq.device)])
-                mask = torch.cat([mask, torch.zeros(padding_len, device=mask.device)])
-                labels = torch.cat([labels, torch.full((padding_len,), -100, device=labels.device)])
-            padded_sequences.append(seq)
-            padded_masks.append(mask)
-            padded_labels.append(labels)
-        
-        # Stack all sequences and masks
-        full_sequences_with_target = torch.stack(padded_sequences)
-        full_attention_masks_with_target = torch.stack(padded_masks)
-        labels = torch.stack(padded_labels)
-        
-        # Compute loss
-        outputs = model(
-            input_ids=full_sequences_with_target,
-            attention_mask=full_attention_masks_with_target,
-            labels=labels,
+
+        # Pad the final combined sequences and labels to form the final batch for the loss calculation.
+        final_batch_dict = self.tokenizer.pad(
+            {"input_ids": final_input_ids_list, "labels": labels_list},
+            padding=True,
+            return_tensors="pt",
         )
         
-        if return_outputs:
-            return outputs.loss, outputs
-        return outputs.loss
+        # tokenizer.pad replaces -100 in labels with pad_token_id. We must change it back.
+        final_batch_dict['labels'][final_batch_dict['labels'] == self.tokenizer.pad_token_id] = -100
+        
+        final_batch = {k: v.to(model.device) for k, v in final_batch_dict.items()}
+
+        # Final forward pass to compute the loss on the correctly masked labels.
+        outputs = model(
+            input_ids=final_batch["input_ids"],
+            attention_mask=final_batch["attention_mask"],
+            labels=final_batch["labels"],
+        )
+        
+        return outputs.loss if not return_outputs else (outputs.loss, outputs)
 
 class CustomDataCollator(DataCollatorForLanguageModeling):
     def __init__(self, tokenizer, mlm=False):
