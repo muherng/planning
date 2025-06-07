@@ -112,18 +112,13 @@ class KStepRolloutTrainer(Trainer):
         A batched and efficient implementation of the k-step rollout loss.
         """
         # Get special token IDs from the tokenizer
-        try:
-            begin_reasoning_id = self.tokenizer.additional_special_tokens_ids[
-                self.tokenizer.additional_special_tokens.index("<begin_reasoning>")
-            ]
-            end_reasoning_id = self.tokenizer.additional_special_tokens_ids[
-                self.tokenizer.additional_special_tokens.index("<end_reasoning>")
-            ]
-        except (ValueError, IndexError):
-            # Fallback for older tokenizer versions
-            begin_reasoning_id = self.tokenizer.encode("<begin_reasoning>", add_special_tokens=False)[0]
-            end_reasoning_id = self.tokenizer.encode("<end_reasoning>", add_special_tokens=False)[0]
-
+        begin_reasoning_id = self.tokenizer.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
+        end_reasoning_id = self.tokenizer.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
+        
+        print(f"\nDebug - Special token IDs in compute_loss:")
+        print(f"begin_reasoning_id: {begin_reasoning_id}")
+        print(f"end_reasoning_id: {end_reasoning_id}")
+        
         # === Stage 1: Prepare a batch of question prompts for generation ===
         # The input_ids from the dataloader contain the full sequence (q + special_tokens + a).
         # We must first extract just the question part for each item.
@@ -136,8 +131,9 @@ class KStepRolloutTrainer(Trainer):
             # Find the position of the special tokens
             begin_reasoning_pos = (seq_ids == begin_reasoning_id).nonzero(as_tuple=True)[0]
             end_reasoning_pos = (seq_ids == end_reasoning_id).nonzero(as_tuple=True)[0]
-
+            print(f"begin_reasoning_pos: {begin_reasoning_pos}, end_reasoning_pos: {end_reasoning_pos}")
             if len(begin_reasoning_pos) == 1 and len(end_reasoning_pos) == 1:
+                raise ValueError('Stop')
                 # Extract question: from <bos> up to and including <begin_reasoning>
                 question = seq_ids[:begin_reasoning_pos[0] + 1]
                 question_ids_list.append(question)
@@ -149,7 +145,9 @@ class KStepRolloutTrainer(Trainer):
                 answer = non_pad_tokens[end_reasoning_pos[0] + 1 : eos_pos[0]]
                 answer_ids_list.append(answer)
 
+        
         if not question_ids_list:
+            print('No valid examples in batch')
             # If the batch contains no valid examples, return zero loss.
             return torch.tensor(0.0, device=model.device, requires_grad=True)
 
@@ -176,7 +174,7 @@ class KStepRolloutTrainer(Trainer):
         # === Stage 3: Combine generated sequences with answers and compute loss ===
         final_input_ids_list = []
         labels_list = []
-
+        raise ValueError('Stop')
         for i in range(len(generated_sequences)):
             # The generated_sequences tensor now contains `question + reasoning`.
             # We need to find the true end of the sequence before any padding.
@@ -202,7 +200,10 @@ class KStepRolloutTrainer(Trainer):
             labels = torch.full_like(final_seq, -100)
             answer_start_index = len(q_and_r_tokens) + 1  # +1 for <end_reasoning>
             # Shift the answer tokens by one position to the left for next token prediction
-            labels[answer_start_index : answer_start_index + len(answer_tokens) - 1] = answer_tokens[1:]
+            labels[answer_start_index : answer_start_index + len(answer_tokens)] = answer_tokens
+            num_supervised = (labels != -100).sum().item()
+            print("supervised tokens in this example:", num_supervised)
+            raise ValueError('Stop')
             labels_list.append(labels)
 
         # Pad the final combined sequences and labels to form the final batch for the loss calculation.
@@ -299,6 +300,13 @@ special_tokens = {
 }
 tokenizer.add_special_tokens(special_tokens)
 
+# Debug prints for special tokens
+print("\nVerifying special tokens:")
+for token in special_tokens["additional_special_tokens"]:
+    token_id = tokenizer.encode(token, add_special_tokens=False)[0]
+    print(f"Token: {token}, ID: {token_id}")
+    print(f"Decoded: {tokenizer.decode([token_id])}")
+
 # Verify special tokens are unique
 for token_name, token in SPECIAL_TOKENS.items():
     token_id = tokenizer.encode(token)[0]
@@ -325,8 +333,12 @@ def format_example(ex):
     # Get special token IDs
     bos_id = tokenizer.bos_token_id
     eos_id = tokenizer.eos_token_id
-    begin_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["begin_reasoning_token"])[0]
-    end_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["end_reasoning_token"])[0]
+    begin_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
+    end_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
+    
+    print(f"\nDebug - Special token IDs in format_example:")
+    print(f"begin_reasoning_id: {begin_reasoning_id}")
+    print(f"end_reasoning_id: {end_reasoning_id}")
     
     # Construct the full sequence with special tokens
     full_sequence = (
@@ -337,6 +349,12 @@ def format_example(ex):
         answer_tokens +          # answer
         [eos_id]                # <eos>
     )
+    
+    # Debug print the sequence
+    print("\nDebug - Sequence construction:")
+    print(f"Full sequence length: {len(full_sequence)}")
+    print(f"Sequence contains begin_reasoning_id: {begin_reasoning_id in full_sequence}")
+    print(f"Sequence contains end_reasoning_id: {end_reasoning_id in full_sequence}")
     
     # Pad to max_length
     if len(full_sequence) < max_length:
@@ -391,7 +409,7 @@ trainer = KStepRolloutTrainer(
     train_dataset=ds["train"],
     eval_dataset=ds["test"],
     data_collator=CustomDataCollator(tokenizer=tokenizer, mlm=False),
-    callbacks=[ErrorRateCallback(test_ds, tokenizer, num_examples=10, eval_steps=500)],
+    #callbacks=[ErrorRateCallback(test_ds, tokenizer, num_examples=10, eval_steps=500)],
     k_tokens=1,  # Number of tokens to generate for reasoning
     tokenizer=tokenizer  # Pass tokenizer explicitly
 )
