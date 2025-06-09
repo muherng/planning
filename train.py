@@ -118,6 +118,7 @@ class KStepRolloutTrainer(Trainer):
         print(f"\nDebug - Special token IDs in compute_loss:")
         print(f"begin_reasoning_id: {begin_reasoning_id}")
         print(f"end_reasoning_id: {end_reasoning_id}")
+        #raise ValueError('Stop')
         
         # === Stage 1: Prepare a batch of question prompts for generation ===
         # The input_ids from the dataloader contain the full sequence (q + special_tokens + a).
@@ -125,15 +126,18 @@ class KStepRolloutTrainer(Trainer):
         
         question_ids_list = []
         answer_ids_list = []
-
+        #raise ValueError('Stop')
         # This small loop is unavoidable but fast as it's just CPU tensor slicing.
         for seq_ids in inputs["input_ids"]:
             # Find the position of the special tokens
             begin_reasoning_pos = (seq_ids == begin_reasoning_id).nonzero(as_tuple=True)[0]
             end_reasoning_pos = (seq_ids == end_reasoning_id).nonzero(as_tuple=True)[0]
             print(f"begin_reasoning_pos: {begin_reasoning_pos}, end_reasoning_pos: {end_reasoning_pos}")
-            if len(begin_reasoning_pos) == 1 and len(end_reasoning_pos) == 1:
+            if len(begin_reasoning_pos) == 0 or len(end_reasoning_pos) == 0:
+                print(f"No begin_reasoning_pos or end_reasoning_pos found in sequence: {seq_ids}")
                 raise ValueError('Stop')
+            if len(begin_reasoning_pos) == 1 and len(end_reasoning_pos) == 1:
+                #raise ValueError('Stop')
                 # Extract question: from <bos> up to and including <begin_reasoning>
                 question = seq_ids[:begin_reasoning_pos[0] + 1]
                 question_ids_list.append(question)
@@ -145,9 +149,10 @@ class KStepRolloutTrainer(Trainer):
                 answer = non_pad_tokens[end_reasoning_pos[0] + 1 : eos_pos[0]]
                 answer_ids_list.append(answer)
 
-        
+        #raise ValueError('Stop')
         if not question_ids_list:
             print('No valid examples in batch')
+            raise ValueError('Stop')
             # If the batch contains no valid examples, return zero loss.
             return torch.tensor(0.0, device=model.device, requires_grad=True)
 
@@ -174,7 +179,7 @@ class KStepRolloutTrainer(Trainer):
         # === Stage 3: Combine generated sequences with answers and compute loss ===
         final_input_ids_list = []
         labels_list = []
-        raise ValueError('Stop')
+        #raise ValueError('Stop')
         for i in range(len(generated_sequences)):
             # The generated_sequences tensor now contains `question + reasoning`.
             # We need to find the true end of the sequence before any padding.
@@ -203,7 +208,7 @@ class KStepRolloutTrainer(Trainer):
             labels[answer_start_index : answer_start_index + len(answer_tokens)] = answer_tokens
             num_supervised = (labels != -100).sum().item()
             print("supervised tokens in this example:", num_supervised)
-            raise ValueError('Stop')
+            #raise ValueError('Stop')
             labels_list.append(labels)
 
         # Pad the final combined sequences and labels to form the final batch for the loss calculation.
@@ -336,9 +341,9 @@ def format_example(ex):
     begin_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
     end_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
     
-    print(f"\nDebug - Special token IDs in format_example:")
-    print(f"begin_reasoning_id: {begin_reasoning_id}")
-    print(f"end_reasoning_id: {end_reasoning_id}")
+    #print(f"\nDebug - Special token IDs in format_example:")
+    #print(f"begin_reasoning_id: {begin_reasoning_id}")
+    #print(f"end_reasoning_id: {end_reasoning_id}")
     
     # Construct the full sequence with special tokens
     full_sequence = (
@@ -351,10 +356,10 @@ def format_example(ex):
     )
     
     # Debug print the sequence
-    print("\nDebug - Sequence construction:")
-    print(f"Full sequence length: {len(full_sequence)}")
-    print(f"Sequence contains begin_reasoning_id: {begin_reasoning_id in full_sequence}")
-    print(f"Sequence contains end_reasoning_id: {end_reasoning_id in full_sequence}")
+    #print("\nDebug - Sequence construction:")
+    #print(f"Full sequence length: {len(full_sequence)}")
+    #print(f"Sequence contains begin_reasoning_id: {begin_reasoning_id in full_sequence}")
+    #print(f"Sequence contains end_reasoning_id: {end_reasoning_id in full_sequence}")
     
     # Pad to max_length
     if len(full_sequence) < max_length:
