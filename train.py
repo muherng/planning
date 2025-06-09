@@ -128,11 +128,16 @@ class KStepRolloutTrainer(Trainer):
         answer_ids_list = []
         #raise ValueError('Stop')
         # This small loop is unavoidable but fast as it's just CPU tensor slicing.
-        for seq_ids in inputs["input_ids"]:
+        for i, seq_ids in enumerate(inputs["input_ids"]):
+            print(f"\nDebug - Processing sequence {i}:")
+            print(f"Sequence length: {len(seq_ids)}")
+            print(f"Non-pad tokens: {(seq_ids != self.tokenizer.pad_token_id).sum().item()}")
+            
             # Find the position of the special tokens
             begin_reasoning_pos = (seq_ids == begin_reasoning_id).nonzero(as_tuple=True)[0]
             end_reasoning_pos = (seq_ids == end_reasoning_id).nonzero(as_tuple=True)[0]
             print(f"begin_reasoning_pos: {begin_reasoning_pos}, end_reasoning_pos: {end_reasoning_pos}")
+            
             if len(begin_reasoning_pos) == 0 or len(end_reasoning_pos) == 0:
                 print(f"No begin_reasoning_pos or end_reasoning_pos found in sequence: {seq_ids}")
                 raise ValueError('Stop')
@@ -264,7 +269,7 @@ if args.checkpoint:
 
 # Model and data configuration
 model_id = "google/gemma-2b"
-max_length = 512
+max_length = 1024
 batch_size = 4
 gradient_accumulation_steps = 4
 
@@ -274,6 +279,42 @@ ds = ds.train_test_split(test_size=0.05, seed=42)
 
 # Keep a copy of the test set before formatting
 test_ds = ds["test"]
+
+# Analyze token lengths in the dataset
+print("\nAnalyzing dataset token lengths...")
+tokenizer = AutoTokenizer.from_pretrained(
+    model_id if args.checkpoint is None else args.checkpoint,
+    local_files_only=True if args.checkpoint else False
+)
+
+def analyze_example_lengths(examples):
+    input_lengths = []
+    label_lengths = []
+    for ex in examples:
+        input_text = f"{SYSTEM}\n\n{PROMPT.format(**ex)}"
+        input_lengths.append(len(tokenizer.encode(input_text, add_special_tokens=False)))
+        label_lengths.append(len(tokenizer.encode(TARGET.format(**ex), add_special_tokens=False)))
+    return {
+        "max_input_length": max(input_lengths),
+        "min_input_length": min(input_lengths),
+        "avg_input_length": sum(input_lengths) / len(input_lengths),
+        "max_label_length": max(label_lengths),
+        "min_label_length": min(label_lengths),
+        "avg_label_length": sum(label_lengths) / len(label_lengths)
+    }
+
+length_stats = analyze_example_lengths(ds["train"])
+print("\nDataset length statistics:")
+print(f"Input lengths - Max: {length_stats['max_input_length']}, Min: {length_stats['min_input_length']}, Avg: {length_stats['avg_input_length']:.1f}")
+print(f"Label lengths - Max: {length_stats['max_label_length']}, Min: {length_stats['min_label_length']}, Avg: {length_stats['avg_label_length']:.1f}")
+
+# Calculate total sequence length needed
+# Base sequence: max_input + max_label + special_tokens + k_tokens
+k_tokens = 1  # This should match the k_tokens parameter in KStepRolloutTrainer
+special_tokens = 4  # bos, begin_reasoning, end_reasoning, eos
+total_sequence_length = length_stats['max_input_length'] + length_stats['max_label_length'] + special_tokens + k_tokens
+
+print(f"\nTotal sequence length needed: {total_sequence_length}")
 
 SYSTEM = "You are a graph‑reasoning assistant."
 PROMPT = "{input}\n\nLet's think step by step:\n"
@@ -335,15 +376,15 @@ def format_example(ex):
     question_tokens = tokenizer.encode(question, add_special_tokens=False)
     answer_tokens = tokenizer.encode(answer, add_special_tokens=False)
     
+    print(f"\nDebug - Token lengths in format_example:")
+    print(f"Question tokens: {len(question_tokens)}")
+    print(f"Answer tokens: {len(answer_tokens)}")
+    
     # Get special token IDs
     bos_id = tokenizer.bos_token_id
     eos_id = tokenizer.eos_token_id
     begin_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
     end_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
-    
-    #print(f"\nDebug - Special token IDs in format_example:")
-    #print(f"begin_reasoning_id: {begin_reasoning_id}")
-    #print(f"end_reasoning_id: {end_reasoning_id}")
     
     # Construct the full sequence with special tokens
     full_sequence = (
@@ -355,17 +396,12 @@ def format_example(ex):
         [eos_id]                # <eos>
     )
     
-    # Debug print the sequence
-    #print("\nDebug - Sequence construction:")
-    #print(f"Full sequence length: {len(full_sequence)}")
-    #print(f"Sequence contains begin_reasoning_id: {begin_reasoning_id in full_sequence}")
-    #print(f"Sequence contains end_reasoning_id: {end_reasoning_id in full_sequence}")
+    print(f"Full sequence length: {len(full_sequence)}")
+    print(f"Special tokens present: begin_reasoning={begin_reasoning_id in full_sequence}, end_reasoning={end_reasoning_id in full_sequence}")
     
-    # Pad to max_length
-    if len(full_sequence) < max_length:
-        full_sequence = full_sequence + [tokenizer.pad_token_id] * (max_length - len(full_sequence))
-    else:
-        full_sequence = full_sequence[:max_length]
+    # Pad to total_sequence_length
+    if len(full_sequence) < total_sequence_length:
+        full_sequence = full_sequence + [tokenizer.pad_token_id] * (total_sequence_length - len(full_sequence))
     
     # Create attention mask (1 for all real tokens, 0 for padding)
     attention_mask = [1] * (len(full_sequence) - full_sequence.count(tokenizer.pad_token_id))
