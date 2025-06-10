@@ -127,7 +127,7 @@ class KStepRolloutTrainer(Trainer):
         # Get special token IDs from the tokenizer
         begin_reasoning_id = self.processing_class.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
         end_reasoning_id = self.processing_class.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
-        raise ValueError('Stop')
+        #raise ValueError('Stop')
         print(f"\nDebug - Special token IDs in compute_loss:")
         print(f"begin_reasoning_id: {begin_reasoning_id}")
         print(f"end_reasoning_id: {end_reasoning_id}")
