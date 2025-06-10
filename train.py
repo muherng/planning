@@ -1,5 +1,6 @@
 import os
 import torch
+import warnings
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -13,6 +14,9 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
+
+# Suppress the specific deprecation warning about Trainer.tokenizer
+warnings.filterwarnings("ignore", message="Trainer.tokenizer is now deprecated")
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -105,7 +109,8 @@ class KStepRolloutTrainer(Trainer):
         if not isinstance(self.data_collator, CustomDataCollator):
             raise ValueError("KStepRolloutTrainer requires CustomDataCollator")
         # Ensure tokenizer is available
-        self.tokenizer = tokenizer if tokenizer is not None else self.data_collator.tokenizer
+        print('WARNING')
+        self.processing_class = tokenizer if tokenizer is not None else self.data_collator.tokenizer
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -119,8 +124,8 @@ class KStepRolloutTrainer(Trainer):
                 raise ValueError(f"All sequences must have length {total_sequence_length}")
         
         # Get special token IDs from the tokenizer
-        begin_reasoning_id = self.tokenizer.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
-        end_reasoning_id = self.tokenizer.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
+        begin_reasoning_id = self.processing_class.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
+        end_reasoning_id = self.processing_class.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
         
         print(f"\nDebug - Special token IDs in compute_loss:")
         print(f"begin_reasoning_id: {begin_reasoning_id}")
@@ -135,14 +140,14 @@ class KStepRolloutTrainer(Trainer):
         
         # This small loop is unavoidable but fast as it's just CPU tensor slicing.
         for i, seq_ids in enumerate(inputs["input_ids"]):
-            print(f"\nDebug - Processing sequence {i}:")
-            print(f"Sequence length: {len(seq_ids)}")
-            print(f"Non-pad tokens: {(seq_ids != self.tokenizer.pad_token_id).sum().item()}")
+            #print(f"\nDebug - Processing sequence {i}:")
+            #print(f"Sequence length: {len(seq_ids)}")
+            #print(f"Non-pad tokens: {(seq_ids != self.processing_class.pad_token_id).sum().item()}")
             
             # Find the position of the special tokens
             begin_reasoning_pos = (seq_ids == begin_reasoning_id).nonzero(as_tuple=True)[0]
             end_reasoning_pos = (seq_ids == end_reasoning_id).nonzero(as_tuple=True)[0]
-            print(f"begin_reasoning_pos: {begin_reasoning_pos}, end_reasoning_pos: {end_reasoning_pos}")
+            #print(f"begin_reasoning_pos: {begin_reasoning_pos}, end_reasoning_pos: {end_reasoning_pos}")
             
             if len(begin_reasoning_pos) == 0 or len(end_reasoning_pos) == 0:
                 print(f"No begin_reasoning_pos or end_reasoning_pos found in sequence: {seq_ids}")
@@ -155,8 +160,8 @@ class KStepRolloutTrainer(Trainer):
                 
                 # Extract answer: from after <end_reasoning> up to <eos>
                 # We assume <eos> is the last token before padding.
-                non_pad_tokens = seq_ids[seq_ids != self.tokenizer.pad_token_id]
-                eos_pos = (non_pad_tokens == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+                non_pad_tokens = seq_ids[seq_ids != self.processing_class.pad_token_id]
+                eos_pos = (non_pad_tokens == self.processing_class.eos_token_id).nonzero(as_tuple=True)[0]
                 answer = non_pad_tokens[end_reasoning_pos[0] + 1 : eos_pos[0]]
                 answer_ids_list.append(answer)
 
@@ -171,13 +176,13 @@ class KStepRolloutTrainer(Trainer):
         padded_questions = []
         for q in question_ids_list:
             if len(q) < max_question_len:
-                padding = torch.full((max_question_len - len(q),), self.tokenizer.pad_token_id, device=q.device)
+                padding = torch.full((max_question_len - len(q),), self.processing_class.pad_token_id, device=q.device)
                 q = torch.cat([q, padding])
             padded_questions.append(q)
         
         question_batch = {
             "input_ids": torch.stack(padded_questions),
-            "attention_mask": (torch.stack(padded_questions) != self.tokenizer.pad_token_id).long()
+            "attention_mask": (torch.stack(padded_questions) != self.processing_class.pad_token_id).long()
         }
 
         # === Stage 2: Generate reasoning for the entire batch in one call ===
@@ -189,8 +194,8 @@ class KStepRolloutTrainer(Trainer):
                 # Use greedy decoding to match the original logic
                 do_sample=False,
                 num_beams=1,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.processing_class.pad_token_id,
+                eos_token_id=self.processing_class.eos_token_id,
             )
 
         # === Stage 3: Combine generated sequences with answers and compute loss ===
@@ -203,7 +208,7 @@ class KStepRolloutTrainer(Trainer):
             q_and_r_tokens = generated_sequences[i]
             
             # Find where the padding starts
-            pad_start_pos = (q_and_r_tokens == self.tokenizer.pad_token_id).nonzero(as_tuple=True)[0]
+            pad_start_pos = (q_and_r_tokens == self.processing_class.pad_token_id).nonzero(as_tuple=True)[0]
             if len(pad_start_pos) > 0:
                 q_and_r_tokens = q_and_r_tokens[:pad_start_pos[0]] # Trim padding
 
@@ -214,12 +219,12 @@ class KStepRolloutTrainer(Trainer):
                 q_and_r_tokens,
                 torch.tensor([end_reasoning_id], device=model.device, dtype=torch.long),
                 answer_tokens,
-                torch.tensor([self.tokenizer.eos_token_id], device=model.device, dtype=torch.long),
+                torch.tensor([self.processing_class.eos_token_id], device=model.device, dtype=torch.long),
             ])
             
             # Pad to total_sequence_length
             if len(final_seq) < total_sequence_length:
-                padding = torch.full((total_sequence_length - len(final_seq),), self.tokenizer.pad_token_id, device=final_seq.device)
+                padding = torch.full((total_sequence_length - len(final_seq),), self.processing_class.pad_token_id, device=final_seq.device)
                 final_seq = torch.cat([final_seq, padding])
             final_input_ids_list.append(final_seq)
             
@@ -229,14 +234,14 @@ class KStepRolloutTrainer(Trainer):
             # Shift the answer tokens by one position to the left for next token prediction
             labels[answer_start_index : answer_start_index + len(answer_tokens)] = answer_tokens
             num_supervised = (labels != -100).sum().item()
-            print("supervised tokens in this example:", num_supervised)
+            #print("supervised tokens in this example:", num_supervised)
             labels_list.append(labels)
 
         # Stack the sequences into a batch
         final_batch = {
             "input_ids": torch.stack(final_input_ids_list),
             "labels": torch.stack(labels_list),
-            "attention_mask": (torch.stack(final_input_ids_list) != self.tokenizer.pad_token_id).long()
+            "attention_mask": (torch.stack(final_input_ids_list) != self.processing_class.pad_token_id).long()
         }
 
         # Final forward pass to compute the loss on the correctly masked labels.
