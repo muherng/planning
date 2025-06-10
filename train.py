@@ -110,7 +110,7 @@ class KStepRolloutTrainer(Trainer):
             raise ValueError("KStepRolloutTrainer requires CustomDataCollator")
         # Ensure tokenizer is available
         print('WARNING')
-        self.processing_class = tokenizer if tokenizer is not None else self.data_collator.tokenizer
+        self.processing_class = tokenizer if tokenizer is not None else self.data_collator.processing_class
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -123,10 +123,11 @@ class KStepRolloutTrainer(Trainer):
                 print(f"Sequence: {seq_ids}")
                 raise ValueError(f"All sequences must have length {total_sequence_length}")
         
+        print('No warning?')
         # Get special token IDs from the tokenizer
         begin_reasoning_id = self.processing_class.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
         end_reasoning_id = self.processing_class.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
-        
+        raise ValueError('Stop')
         print(f"\nDebug - Special token IDs in compute_loss:")
         print(f"begin_reasoning_id: {begin_reasoning_id}")
         print(f"end_reasoning_id: {end_reasoning_id}")
@@ -256,7 +257,7 @@ class KStepRolloutTrainer(Trainer):
 class CustomDataCollator(DataCollatorForLanguageModeling):
     def __init__(self, tokenizer, mlm=False):
         super().__init__(tokenizer=tokenizer, mlm=mlm)
-        self.tokenizer = tokenizer
+        self.processing_class = tokenizer
 
     def torch_call(self, examples):
         # Convert examples to tensors
