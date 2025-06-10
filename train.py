@@ -109,149 +109,85 @@ class KStepRolloutTrainer(Trainer):
         if not isinstance(self.data_collator, CustomDataCollator):
             raise ValueError("KStepRolloutTrainer requires CustomDataCollator")
         # Ensure tokenizer is available
-        print('WARNING')
         self.processing_class = tokenizer if tokenizer is not None else self.data_collator.processing_class
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
-        A batched and efficient implementation of the k-step rollout loss.
+        Implements a two-stage latent-reasoning pipeline:
+        1. Generation pass (no grad): Generate K reasoning tokens
+        2. Supervised pass (with grad): Compute loss on answer span
         """
-        # Verify all sequences have the correct length
-        for i, seq_ids in enumerate(inputs["input_ids"]):
-            if len(seq_ids) != total_sequence_length:
-                print(f"\nError: Sequence {i} has length {len(seq_ids)}, expected {total_sequence_length}")
-                print(f"Sequence: {seq_ids}")
-                raise ValueError(f"All sequences must have length {total_sequence_length}")
-        
-        print('No warning?')
-        # Get special token IDs from the tokenizer
-        begin_reasoning_id = self.processing_class.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
-        end_reasoning_id = self.processing_class.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
-        #raise ValueError('Stop')
-        print(f"\nDebug - Special token IDs in compute_loss:")
-        print(f"begin_reasoning_id: {begin_reasoning_id}")
-        print(f"end_reasoning_id: {end_reasoning_id}")
-        
-        # === Stage 1: Prepare a batch of question prompts for generation ===
-        # The input_ids from the dataloader contain the full sequence (q + special_tokens + a).
-        # We must first extract just the question part for each item.
-        
-        question_ids_list = []
-        answer_ids_list = []
-        
-        # This small loop is unavoidable but fast as it's just CPU tensor slicing.
-        for i, seq_ids in enumerate(inputs["input_ids"]):
-            #print(f"\nDebug - Processing sequence {i}:")
-            #print(f"Sequence length: {len(seq_ids)}")
-            #print(f"Non-pad tokens: {(seq_ids != self.processing_class.pad_token_id).sum().item()}")
-            
-            # Find the position of the special tokens
-            begin_reasoning_pos = (seq_ids == begin_reasoning_id).nonzero(as_tuple=True)[0]
-            end_reasoning_pos = (seq_ids == end_reasoning_id).nonzero(as_tuple=True)[0]
-            #print(f"begin_reasoning_pos: {begin_reasoning_pos}, end_reasoning_pos: {end_reasoning_pos}")
-            
-            if len(begin_reasoning_pos) == 0 or len(end_reasoning_pos) == 0:
-                print(f"No begin_reasoning_pos or end_reasoning_pos found in sequence: {seq_ids}")
-                raise ValueError('Stop')
-            
-            if len(begin_reasoning_pos) == 1 and len(end_reasoning_pos) == 1:
-                # Extract question: from <bos> up to and including <begin_reasoning>
-                question = seq_ids[:begin_reasoning_pos[0] + 1]
-                question_ids_list.append(question)
-                
-                # Extract answer: from after <end_reasoning> up to <eos>
-                # We assume <eos> is the last token before padding.
-                non_pad_tokens = seq_ids[seq_ids != self.processing_class.pad_token_id]
-                eos_pos = (non_pad_tokens == self.processing_class.eos_token_id).nonzero(as_tuple=True)[0]
-                answer = non_pad_tokens[end_reasoning_pos[0] + 1 : eos_pos[0]]
-                answer_ids_list.append(answer)
+        # Get special token IDs
+        BOS_ID = self.processing_class.bos_token_id
+        PAD_ID = self.processing_class.pad_token_id
+        EOS_ID = self.processing_class.eos_token_id
+        BEGIN_ID = self.processing_class.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
+        END_ID = self.processing_class.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
 
-        if not question_ids_list:
-            print('No valid examples in batch')
-            raise ValueError('Stop')
-            # If the batch contains no valid examples, return zero loss.
-            return torch.tensor(0.0, device=model.device, requires_grad=True)
+        # ---------- 1. isolate prompts ----------
+        seqs = inputs["input_ids"]  # (B, TOTAL_LEN)
+        begin_pos = (seqs == BEGIN_ID).long().argmax(-1)  # first BEGIN per row
+        prompts = []
+        for row, pos in zip(seqs, begin_pos):
+            prompts.append(row[:pos+1])  # inclusive of BEGIN_ID
 
-        # Pad questions to the same length
-        max_question_len = max(len(q) for q in question_ids_list)
-        padded_questions = []
-        for q in question_ids_list:
-            if len(q) < max_question_len:
-                padding = torch.full((max_question_len - len(q),), self.processing_class.pad_token_id, device=q.device)
-                q = torch.cat([q, padding])
-            padded_questions.append(q)
-        
-        question_batch = {
-            "input_ids": torch.stack(padded_questions),
-            "attention_mask": (torch.stack(padded_questions) != self.processing_class.pad_token_id).long()
-        }
-
-        # === Stage 2: Generate reasoning for the entire batch in one call ===
+        # ---------- 2. left‑pad & generate ----------
+        old_side = self.processing_class.padding_side
+        self.processing_class.padding_side = "left"
+        prompt_batch = self.processing_class.pad(
+            {"input_ids": prompts}, return_tensors="pt"
+        ).to(model.device)
+        model.eval()
         with torch.no_grad():
-            generated_sequences = model.generate(
-                input_ids=question_batch["input_ids"],
-                attention_mask=question_batch["attention_mask"],
+            gen = model.generate(
+                **prompt_batch,
                 max_new_tokens=self.k_tokens,
-                # Use greedy decoding to match the original logic
-                do_sample=False,
-                num_beams=1,
-                pad_token_id=self.processing_class.pad_token_id,
-                eos_token_id=self.processing_class.eos_token_id,
+                pad_token_id=PAD_ID,
+                eos_token_id=EOS_ID,
+                use_cache=True
             )
+        model.train()
+        self.processing_class.padding_side = old_side
 
-        # === Stage 3: Combine generated sequences with answers and compute loss ===
-        final_input_ids_list = []
-        labels_list = []
-        
-        for i in range(len(generated_sequences)):
-            # The generated_sequences tensor now contains `question + reasoning`.
-            # We need to find the true end of the sequence before any padding.
-            q_and_r_tokens = generated_sequences[i]
-            
-            # Find where the padding starts
-            pad_start_pos = (q_and_r_tokens == self.processing_class.pad_token_id).nonzero(as_tuple=True)[0]
-            if len(pad_start_pos) > 0:
-                q_and_r_tokens = q_and_r_tokens[:pad_start_pos[0]] # Trim padding
+        # strip left pads & keep the last K tokens
+        gen_reasonings = []
+        for row in gen:
+            row = row[row != PAD_ID]  # remove leading pads
+            gen_reasonings.append(row[-self.k_tokens:])  # K newly generated tokens
 
-            answer_tokens = answer_ids_list[i].to(model.device)
+        # ---------- 3. re‑assemble full sequences ----------
+        new_input_ids = []
+        new_labels = []
+        for orig, reas in zip(seqs, gen_reasonings):
+            # locate placeholder start (just after BEGIN_ID)
+            start = (orig == BEGIN_ID).nonzero(as_tuple=True)[0][0] + 1
 
-            # Construct the final sequence: [question + reasoning] + [<end_reasoning>] + [answer] + [<eos>]
-            final_seq = torch.cat([
-                q_and_r_tokens,
-                torch.tensor([end_reasoning_id], device=model.device, dtype=torch.long),
-                answer_tokens,
-                torch.tensor([self.processing_class.eos_token_id], device=model.device, dtype=torch.long),
-            ])
-            
-            # Pad to total_sequence_length
-            if len(final_seq) < total_sequence_length:
-                padding = torch.full((total_sequence_length - len(final_seq),), self.processing_class.pad_token_id, device=final_seq.device)
-                final_seq = torch.cat([final_seq, padding])
-            final_input_ids_list.append(final_seq)
-            
-            # Create the labels tensor, masking everything except the answer.
-            labels = torch.full_like(final_seq, -100)
-            answer_start_index = len(q_and_r_tokens) + 1  # +1 for <end_reasoning>
-            # Shift the answer tokens by one position to the left for next token prediction
-            labels[answer_start_index : answer_start_index + len(answer_tokens)] = answer_tokens
-            num_supervised = (labels != -100).sum().item()
-            #print("supervised tokens in this example:", num_supervised)
-            labels_list.append(labels)
+            # replace the K pads
+            rebuilt = orig.clone()
+            rebuilt[start : start+self.k_tokens] = reas
 
-        # Stack the sequences into a batch
-        final_batch = {
-            "input_ids": torch.stack(final_input_ids_list),
-            "labels": torch.stack(labels_list),
-            "attention_mask": (torch.stack(final_input_ids_list) != self.processing_class.pad_token_id).long()
-        }
+            # build labels: supervise only ANSWER (after END_ID) (+ eos)
+            labels = torch.full_like(rebuilt, -100)
+            end_pos = (rebuilt == END_ID).nonzero(as_tuple=True)[0][0]
+            ans_start = end_pos + 1
+            eos_pos = (rebuilt == EOS_ID).nonzero(as_tuple=True)[0][0]
+            labels[ans_start : eos_pos] = rebuilt[ans_start : eos_pos]
+            labels[eos_pos] = EOS_ID  # supervise eos token
 
-        # Final forward pass to compute the loss on the correctly masked labels.
+            new_input_ids.append(rebuilt)
+            new_labels.append(labels)
+
+        input_ids = torch.stack(new_input_ids)
+        labels = torch.stack(new_labels)
+        attn_mask = (input_ids != PAD_ID).long()
+
+        # ---------- 4. supervised forward ----------
         outputs = model(
-            input_ids=final_batch["input_ids"],
-            attention_mask=final_batch["attention_mask"],
-            labels=final_batch["labels"],
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            labels=labels
         )
-        
+
         return outputs.loss if not return_outputs else (outputs.loss, outputs)
 
 class CustomDataCollator(DataCollatorForLanguageModeling):
