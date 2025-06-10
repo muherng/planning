@@ -126,7 +126,13 @@ class KStepRolloutTrainer(Trainer):
 
         # ---------- 1. isolate prompts ----------
         seqs = inputs["input_ids"]  # (B, TOTAL_LEN)
-        begin_pos = (seqs == BEGIN_ID).long().argmax(-1)  # first BEGIN per row
+        #begin_pos = (seqs == BEGIN_ID).long().argmax(-1)  # first BEGIN per row
+        # --- safer begin_position retrieval in compute_loss ---
+        begin_idxs = (seqs == BEGIN_ID).nonzero(as_tuple=True)
+        if begin_idxs[0].numel() != seqs.size(0):
+            raise ValueError("BEGIN_ID missing in some sequences")
+        begin_pos = begin_idxs[1]          # shape: (B,)
+        
         prompts = []
         for row, pos in zip(seqs, begin_pos):
             prompts.append(row[:pos+1])  # inclusive of BEGIN_ID
@@ -149,11 +155,9 @@ class KStepRolloutTrainer(Trainer):
         model.train()
         self.processing_class.padding_side = old_side
 
-        # strip left pads & keep the last K tokens
-        gen_reasonings = []
-        for row in gen:
-            row = row[row != PAD_ID]  # remove leading pads
-            gen_reasonings.append(row[-self.k_tokens:])  # K newly generated tokens
+        # --- keep exactly K new tokens without stripping internal pads ---
+        prompt_len = prompt_batch["input_ids"].shape[1]
+        gen_reasonings = [row[prompt_len:] for row in gen]
 
         # ---------- 3. re‑assemble full sequences ----------
         new_input_ids = []
@@ -361,8 +365,9 @@ def format_example(ex):
         full_sequence = full_sequence + [tokenizer.pad_token_id] * (total_sequence_length - len(full_sequence))
     
     # Create attention mask (1 for all real tokens, 0 for padding)
-    attention_mask = [1] * (len(full_sequence) - full_sequence.count(tokenizer.pad_token_id))
-    attention_mask.extend([0] * full_sequence.count(tokenizer.pad_token_id))
+    # --- format_example() attention mask fix ---
+    attention_mask = [0 if t == tokenizer.pad_token_id else 1
+                    for t in full_sequence]
     
     return {
         "input_ids": full_sequence,
