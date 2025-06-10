@@ -280,6 +280,11 @@ ds = ds.train_test_split(test_size=0.05, seed=42)
 # Keep a copy of the test set before formatting
 test_ds = ds["test"]
 
+# Define prompts
+SYSTEM = "You are a graph‑reasoning assistant."
+PROMPT = "{input}\n\nLet's think step by step:\n"
+TARGET = "{label}"
+
 # Analyze token lengths in the dataset
 print("\nAnalyzing dataset token lengths...")
 tokenizer = AutoTokenizer.from_pretrained(
@@ -315,10 +320,6 @@ special_tokens = 4  # bos, begin_reasoning, end_reasoning, eos
 total_sequence_length = length_stats['max_input_length'] + length_stats['max_label_length'] + special_tokens + k_tokens
 
 print(f"\nTotal sequence length needed: {total_sequence_length}")
-
-SYSTEM = "You are a graph‑reasoning assistant."
-PROMPT = "{input}\n\nLet's think step by step:\n"
-TARGET = "{label}"
 
 # Add special tokens for our task
 SPECIAL_TOKENS = {
@@ -376,28 +377,31 @@ def format_example(ex):
     question_tokens = tokenizer.encode(question, add_special_tokens=False)
     answer_tokens = tokenizer.encode(answer, add_special_tokens=False)
     
-    print(f"\nDebug - Token lengths in format_example:")
-    print(f"Question tokens: {len(question_tokens)}")
-    print(f"Answer tokens: {len(answer_tokens)}")
-    
     # Get special token IDs
     bos_id = tokenizer.bos_token_id
     eos_id = tokenizer.eos_token_id
     begin_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
     end_reasoning_id = tokenizer.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
     
-    # Construct the full sequence with special tokens
+    # Calculate space needed for reasoning tokens
+    reasoning_space = k_tokens  # This will be filled with reasoning tokens during training
+    
+    # Calculate space needed for special tokens
+    special_tokens_space = 4  # bos, begin_reasoning, end_reasoning, eos
+    
+    # Calculate how much space is available for question and answer
+    available_space = total_sequence_length - special_tokens_space - reasoning_space
+    
+    # Construct the full sequence with special tokens and padding
     full_sequence = (
         [bos_id] +                # <bos>
         question_tokens +         # question
         [begin_reasoning_id] +    # <begin_reasoning>
+        [tokenizer.pad_token_id] * reasoning_space +  # Space for reasoning tokens
         [end_reasoning_id] +     # <end_reasoning>
         answer_tokens +          # answer
         [eos_id]                # <eos>
     )
-    
-    print(f"Full sequence length: {len(full_sequence)}")
-    print(f"Special tokens present: begin_reasoning={begin_reasoning_id in full_sequence}, end_reasoning={end_reasoning_id in full_sequence}")
     
     # Pad to total_sequence_length
     if len(full_sequence) < total_sequence_length:
