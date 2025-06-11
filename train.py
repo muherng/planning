@@ -20,88 +20,6 @@ warnings.filterwarnings("ignore", message="Trainer.tokenizer is now deprecated")
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-class ErrorRateCallback(TrainerCallback):
-    def __init__(self, eval_dataset, tokenizer, num_examples=100, eval_steps=100):
-        print("Initializing ErrorRateCallback")
-        # Format the dataset first, just like in evaluate.py
-        formatted_ds = eval_dataset.map(format_eval_example)
-        self.eval_dataset = formatted_ds.select(range(num_examples))
-        self.tokenizer = tokenizer
-        self.num_examples = num_examples
-        self.max_length = 512
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.eval_steps = eval_steps
-
-
-    def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % self.eval_steps == 0:
-            print(f"Computing error rate at step {state.global_step}")
-            model = kwargs.get('model')
-            if model is None:
-                print("Model not found in kwargs")
-                return
-                
-            model.eval()
-            correct = 0
-            total = 0
-
-            for ex in tqdm(self.eval_dataset, desc=f"Computing error rate at step {state.global_step}"):
-                # Use the formatted text directly
-                input_text = ex["prompt"]
-                
-                # Tokenize input
-                inputs = self.tokenizer(input_text, return_tensors="pt", truncation=True, max_length=self.max_length).to(self.device)
-
-                # Generate answer
-                with torch.no_grad():
-                    generated_ids = model.generate(
-                        **inputs,
-                        max_new_tokens=512,
-                        do_sample=False,
-                        num_beams=1,
-                        temperature=1.0,
-                        top_p=1.0,
-                        pad_token_id=self.tokenizer.eos_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                        early_stopping=True,
-                        forced_bos_token_id=self.tokenizer.bos_token_id,
-                        forced_eos_token_id=self.tokenizer.eos_token_id
-                    )
-                generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-
-                # Extract the answer part from the generated text
-                if "### Answer:\n" in generated_text:
-                    answer = generated_text.split("### Answer:\n", 1)[1].strip()
-                    answer = answer.replace("<eos>", "").strip()
-                else:
-                    answer = generated_text.strip()
-
-                # Get the ground truth answer
-                gt_answer = ex["label"].strip()
-
-                # Truncate generated answer to match ground truth length
-                answer = answer[:len(gt_answer)]
-
-                # Compare answers (using startswith)
-                if answer.startswith(gt_answer):
-                    correct += 1
-                total += 1
-
-                # Print example with reasoning for debugging
-                if total <= 3:  # Print first 3 examples
-                    print("\nExample:")
-                    print(f"Input: {ex['input']}")
-                    print(f"Generated reasoning and answer: {generated_text}")
-                    print(f"Ground truth: {gt_answer}")
-                    print(f"Correct: {answer.startswith(gt_answer)}")
-
-            error_rate = 1 - (correct / total)
-            print(f"\nStep {state.global_step} - Error rate on {self.num_examples} examples: {error_rate:.4f}")
-            model.train()  # Set model back to training mode
-
-    def on_train_end(self, args, state, control, **kwargs):
-        print("Training ended")
-
 class ExactMatchCallback(TrainerCallback):
     """
     Periodically runs full‑pipeline inference on the held‑out set and
@@ -383,7 +301,7 @@ print(f"Label lengths - Max: {length_stats['max_label_length']}, Min: {length_st
 
 # Calculate total sequence length needed
 # Base sequence: max_input + max_label + special_tokens + k_tokens
-k_tokens = 1  # This should match the k_tokens parameter in KStepRolloutTrainer
+k_tokens = args.k_tokens  # This should match the k_tokens parameter in KStepRolloutTrainer
 special_tokens = 4  # bos, begin_reasoning, end_reasoning, eos
 total_sequence_length = length_stats['max_input_length'] + length_stats['max_label_length'] + special_tokens + k_tokens
 
