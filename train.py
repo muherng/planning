@@ -102,6 +102,114 @@ class ErrorRateCallback(TrainerCallback):
     def on_train_end(self, args, state, control, **kwargs):
         print("Training ended")
 
+class ExactMatchCallback(TrainerCallback):
+    """
+    Periodically runs full‑pipeline inference on the held‑out set and
+    prints exact‑match accuracy (all answer tokens must match).
+    """
+
+    def __init__(
+        self,
+        eval_dataset,
+        tokenizer,
+        k_tokens: int,
+        eval_steps: int = 1000,
+        max_answer_tokens: int = 128,
+    ):
+        # store raw (un‑formatted) dataset; we re‑format on the fly
+        self.eval_ds = eval_dataset
+        self.tok = tokenizer
+        self.k = k_tokens
+        self.eval_steps = eval_steps
+        self.max_answer = max_answer_tokens
+
+        # constant IDs
+        self.BOS = tokenizer.bos_token_id
+        self.PAD = tokenizer.pad_token_id
+        self.EOS = tokenizer.eos_token_id
+        self.BEGIN = tokenizer.encode(
+            SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False
+        )[0]
+        self.END = tokenizer.encode(
+            SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False
+        )[0]
+
+    # ────────────────────────────────────────────────────────────────
+    # helper: build prompt ids  <bos>  question  <begin_reasoning>
+    # ────────────────────────────────────────────────────────────────
+    def _build_prompt(self, ex):
+        q_text = (
+            f"{SYSTEM}\n\n{PROMPT.format(**ex)}"
+        )  # >>> same recipe as format_example
+        q_ids = self.tok.encode(q_text, add_special_tokens=False)
+        return torch.tensor([self.BOS] + q_ids + [self.BEGIN], dtype=torch.long)
+
+    # ────────────────────────────────────────────────────────────────
+    # main callback hook
+    # ────────────────────────────────────────────────────────────────
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.eval_steps != 0:
+            return
+
+        model = kwargs["model"]
+        device = next(model.parameters()).device
+        model.eval()
+
+        exact, total = 0, 0
+
+        for ex in tqdm(self.eval_ds, desc=f"[EM eval @ {state.global_step}]"):
+            # ----- 1. build prompt & generate K‑token reasoning -----
+            prompt = self._build_prompt(ex).to(device).unsqueeze(0)
+            with torch.no_grad():
+                gen1 = model.generate(
+                    prompt,
+                    max_new_tokens=self.k,
+                    pad_token_id=self.PAD,
+                    eos_token_id=self.EOS,
+                    use_cache=True,
+                )
+            reasoning = gen1[0][-self.k :].tolist()
+
+            # ----- 2. build second input  prompt + reasoning + <end> -----
+            start2 = torch.tensor(
+                prompt.tolist()[0] + reasoning + [self.END], device=device
+            ).unsqueeze(0)
+
+            # ----- 3. generate answer autoregressively -----
+            with torch.no_grad():
+                gen2 = model.generate(
+                    start2,
+                    max_new_tokens=self.max_answer,
+                    pad_token_id=self.PAD,
+                    eos_token_id=self.EOS,
+                    use_cache=True,
+                )
+
+            answer_tokens = (
+                gen2[0][start2.shape[1] :]  # tokens after <end_reasoning>
+            )
+            pred_answer = self.tok.decode(answer_tokens, skip_special_tokens=True).strip()
+            gold_answer = ex["label"].strip()
+
+            exact += int(pred_answer == gold_answer)
+            total += 1
+
+            if total <= 3:  # print a few examples
+                print("\n── Example ──")
+                print("Q:", ex["input"])
+                print("Pred:", pred_answer)
+                print("Gold:", gold_answer)
+                print("Match:", pred_answer == gold_answer)
+
+        acc = exact / total if total else 0.0
+        print(
+            f"\n[Step {state.global_step}] exact‑match accuracy "
+            f"on {total} eval examples: {acc:.4%}"
+        )
+
+        model.train()
+
+
 class KStepRolloutTrainer(Trainer):
     def __init__(self, *args, k_tokens=20, tokenizer=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -213,6 +321,8 @@ def parse_args():
                       help='Path to model checkpoint directory to resume training from')
     parser.add_argument('--output_dir', type=str, default='saved_models/gemma-shortest-path',
                       help='Directory to save model checkpoints')
+    parser.add_argument('--k_tokens', type=int, default=1,
+                      help='Number of tokens to generate for reasoning')
     return parser.parse_args()
 
 # Parse arguments
@@ -232,7 +342,8 @@ gradient_accumulation_steps = 4
 
 # Load dataset
 ds = load_dataset("json", data_files="data/shortest_paths_train.jsonl")["train"]
-ds = ds.train_test_split(test_size=0.05, seed=42)
+# Split into train and test with fixed test size
+ds = ds.train_test_split(test_size=10, seed=42)
 
 # Keep a copy of the test set before formatting
 test_ds = ds["test"]
@@ -393,7 +504,7 @@ training_args = TrainingArguments(
     per_device_eval_batch_size=batch_size,
     gradient_accumulation_steps=gradient_accumulation_steps,
     save_strategy="steps",
-    save_steps=100,
+    save_steps=500,
     logging_steps=10,
     learning_rate=2e-5,
     weight_decay=0.01,
@@ -412,8 +523,10 @@ trainer = KStepRolloutTrainer(
     train_dataset=ds["train"],
     eval_dataset=ds["test"],
     data_collator=CustomDataCollator(tokenizer=tokenizer, mlm=False),
-    #callbacks=[ErrorRateCallback(test_ds, tokenizer, num_examples=10, eval_steps=500)],
-    k_tokens=1,  # Number of tokens to generate for reasoning
+    callbacks=[
+        ExactMatchCallback(test_ds, tokenizer, k_tokens=args.k_tokens, eval_steps=100)
+    ],
+    k_tokens=args.k_tokens,  # Number of tokens to generate for reasoning
     tokenizer=tokenizer  # Pass tokenizer explicitly
 )
 print("Trainer created")  # Debug print
