@@ -317,7 +317,7 @@ if args.checkpoint:
 
 # Model and data configuration
 model_id = "google/gemma-2b"
-max_length = 1024
+max_length = 100000
 batch_size = 4
 gradient_accumulation_steps = 4
 
