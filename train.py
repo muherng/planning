@@ -14,11 +14,41 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
+import json
 
 # Suppress the specific deprecation warning about Trainer.tokenizer
 warnings.filterwarnings("ignore", message="Trainer.tokenizer is now deprecated")
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+def get_formatted_dataset_path(data_file, k_tokens):
+    """Generate path for formatted dataset based on input file and k_tokens."""
+    data_path = Path(data_file)
+    base_name = data_path.stem  # filename without extension
+    formatted_name = f"{base_name}_formatted_k{k_tokens}.json"
+    return Path("data") / formatted_name
+
+def save_formatted_dataset(dataset, data_file, k_tokens):
+    """Save formatted dataset to disk."""
+    save_path = get_formatted_dataset_path(data_file, k_tokens)
+    save_path.parent.mkdir(exist_ok=True)
+    
+    print(f"Saving formatted dataset to {save_path}")
+    dataset.save_to_disk(str(save_path.with_suffix('')))
+    print(f"Formatted dataset saved successfully")
+
+def load_formatted_dataset(data_file, k_tokens):
+    """Load formatted dataset from disk if it exists."""
+    load_path = get_formatted_dataset_path(data_file, k_tokens)
+    load_path_dir = load_path.with_suffix('')
+    
+    if load_path_dir.exists():
+        print(f"Loading pre-formatted dataset from {load_path_dir}")
+        from datasets import load_from_disk
+        return load_from_disk(str(load_path_dir))
+    else:
+        print(f"No pre-formatted dataset found at {load_path_dir}")
+        return None
 
 class ExactMatchCallback(TrainerCallback):
     """
@@ -127,8 +157,8 @@ class ExactMatchCallback(TrainerCallback):
 
         acc = exact / total if total else 0.0
         print(
-            f"\n[Step {state.global_step}] exact‑match accuracy "
-            f"on {total} eval examples: {acc:.4%}"
+            f"\n[Step {state.global_step}] exact‑match accuracy "
+            f"on {total} eval examples: {acc:.4%}"
         )
 
         model.train()
@@ -292,20 +322,35 @@ batch_size = 4
 gradient_accumulation_steps = 4
 
 # Load dataset
-ds = load_dataset("json", data_files="data/shortest_paths_train.jsonl")["train"]
-# Split into train and test with fixed test size
-ds = ds.train_test_split(test_size=10, seed=42)
+print(f"Loading dataset from {args.data_file}")
 
-# Keep a copy of the test set before formatting
-test_ds = ds["test"]
+ds = None
+test_ds = None
+
+# Try to load pre-formatted dataset if requested
+if args.use_cached_data:
+    ds = load_formatted_dataset(args.data_file, args.k_tokens)
+    if ds is not None:
+        # Dataset was loaded from cache
+        test_ds = ds["test"]
+        print("Using cached formatted dataset")
+
+# If no cached dataset was loaded, process from scratch
+if ds is None:
+    print("Processing dataset from scratch...")
+    ds = load_dataset("json", data_files=args.data_file)["train"]
+    # Split into train and test with fixed test size
+    ds = ds.train_test_split(test_size=10, seed=42)
+    
+    # Keep a copy of the test set before formatting
+    test_ds = ds["test"]
 
 # Define prompts
 SYSTEM = "You are a graph‑reasoning assistant."
 PROMPT = "{input}\n\nLet's think step by step:\n"
 TARGET = "{label}"
 
-# Analyze token lengths in the dataset
-print("\nAnalyzing dataset token lengths...")
+# Analyze token lengths in the dataset (only if processing from scratch)
 tokenizer = AutoTokenizer.from_pretrained(
     model_id if args.checkpoint is None else args.checkpoint,
     local_files_only=True if args.checkpoint else False
@@ -327,18 +372,27 @@ def analyze_example_lengths(examples):
         "avg_label_length": sum(label_lengths) / len(label_lengths)
     }
 
-length_stats = analyze_example_lengths(ds["train"])
-print("\nDataset length statistics:")
-print(f"Input lengths - Max: {length_stats['max_input_length']}, Min: {length_stats['min_input_length']}, Avg: {length_stats['avg_input_length']:.1f}")
-print(f"Label lengths - Max: {length_stats['max_label_length']}, Min: {length_stats['min_label_length']}, Avg: {length_stats['avg_label_length']:.1f}")
-
-# Calculate total sequence length needed
-# Base sequence: max_input + max_label + special_tokens + k_tokens
-k_tokens = args.k_tokens  # This should match the k_tokens parameter in KStepRolloutTrainer
-special_tokens = 4  # bos, begin_reasoning, end_reasoning, eos
-total_sequence_length = length_stats['max_input_length'] + length_stats['max_label_length'] + special_tokens + k_tokens
-
-print(f"\nTotal sequence length needed: {total_sequence_length}")
+# Only analyze lengths if we have the original data (not cached formatted data)
+if 'input' in ds["train"].column_names:
+    print("\nAnalyzing dataset token lengths...")
+    length_stats = analyze_example_lengths(ds["train"])
+    print("\nDataset length statistics:")
+    print(f"Input lengths - Max: {length_stats['max_input_length']}, Min: {length_stats['min_input_length']}, Avg: {length_stats['avg_input_length']:.1f}")
+    print(f"Label lengths - Max: {length_stats['max_label_length']}, Min: {length_stats['min_label_length']}, Avg: {length_stats['avg_label_length']:.1f}")
+    
+    # Calculate total sequence length needed
+    # Base sequence: max_input + max_label + special_tokens + k_tokens
+    k_tokens = args.k_tokens  # This should match the k_tokens parameter in KStepRolloutTrainer
+    special_tokens = 4  # bos, begin_reasoning, end_reasoning, eos
+    total_sequence_length = length_stats['max_input_length'] + length_stats['max_label_length'] + special_tokens + k_tokens
+    
+    print(f"\nTotal sequence length needed: {total_sequence_length}")
+else:
+    print("\nUsing cached formatted dataset - skipping token length analysis")
+    # For cached data, we need to determine sequence length from the actual data
+    sample_length = len(ds["train"][0]["input_ids"])
+    total_sequence_length = sample_length
+    print(f"Sequence length from cached data: {total_sequence_length}")
 
 # Add special tokens for our task
 SPECIAL_TOKENS = {
@@ -434,8 +488,16 @@ def format_example(ex):
         "attention_mask": attention_mask
     }
 
-# Format dataset for training
-ds = ds.map(format_example, remove_columns=["input", "label"])
+# Format dataset for training (only if not loaded from cache)
+cached_dataset_loaded = args.use_cached_data and 'input_ids' in ds['train'].column_names if ds is not None else False
+
+if not cached_dataset_loaded:
+    print("Formatting dataset...")
+    ds = ds.map(format_example, remove_columns=["input", "label"])
+    
+    # Save formatted dataset if requested
+    if args.save_formatted_data:
+        save_formatted_dataset(ds, args.data_file, args.k_tokens)
 
 # Create a separate formatted dataset for evaluation
 def format_eval_example(ex):
