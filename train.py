@@ -118,6 +118,7 @@ class ExactMatchCallback(TrainerCallback):
                 print("Pred:", pred_answer)
                 print("Gold:", gold_answer)
                 print("Match:", pred_answer == gold_answer)
+                print("Reasoning:", self.tok.decode(reasoning, skip_special_tokens=True))
 
         acc = exact / total if total else 0.0
         print(

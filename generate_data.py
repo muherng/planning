@@ -6,7 +6,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Generate shortest path dataset')
     parser.add_argument('--max_nodes', type=int, default=8,
                       help='Maximum number of nodes in generated graphs')
-    parser.add_argument('--p', type=float, default=0.4,
+    parser.add_argument('--p', type=float, default=0.1,
                       help='Edge probability for random graph generation')
     parser.add_argument('--train_samples', type=int, default=100000,
                       help='Number of training examples to generate')
