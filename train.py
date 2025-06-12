@@ -157,8 +157,8 @@ class ExactMatchCallback(TrainerCallback):
 
         acc = exact / total if total else 0.0
         print(
-            f"\n[Step {state.global_step}] exact‑match accuracy "
-            f"on {total} eval examples: {acc:.4%}"
+            f"\n[Step {state.global_step}] exact‑match accuracy "
+            f"on {total} eval examples: {acc:.4%}"
         )
 
         model.train()
@@ -283,11 +283,12 @@ class CustomDataCollator(DataCollatorForLanguageModeling):
         self.processing_class = tokenizer
 
     def torch_call(self, examples):
-        # Convert examples to tensors
-        batch = {
-            "input_ids": torch.stack([torch.tensor(x["input_ids"]) for x in examples]),
-            "attention_mask": torch.stack([torch.tensor(x["attention_mask"]) for x in examples])
-        }
+        # Dynamically pad to the longest sequence in the current batch
+        batch = self.processing_class.pad(
+            examples,
+            padding="longest",
+            return_tensors="pt"
+        )
         return batch
 
 def parse_args():
@@ -411,6 +412,7 @@ tokenizer = AutoTokenizer.from_pretrained(
 
 # Add our special tokens
 special_tokens = {
+    "pad_token": SPECIAL_TOKENS["pad_token"],
     "additional_special_tokens": [
         SPECIAL_TOKENS["begin_reasoning_token"],
         SPECIAL_TOKENS["end_reasoning_token"]
@@ -438,6 +440,7 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto"
 )
 model.resize_token_embeddings(len(tokenizer))
+model.config.pad_token_id = tokenizer.pad_token_id  # ensure model knows the new pad token
 
 def format_example(ex):
     # Format the basic sequence: question + separator + answer
@@ -463,25 +466,19 @@ def format_example(ex):
     # Calculate how much space is available for question and answer
     available_space = total_sequence_length - special_tokens_space - reasoning_space
     
-    # Construct the full sequence with special tokens and padding
+    # Construct the full sequence with special tokens (no global padding)
     full_sequence = (
         [bos_id] +                # <bos>
         question_tokens +         # question
         [begin_reasoning_id] +    # <begin_reasoning>
         [tokenizer.pad_token_id] * reasoning_space +  # Space for reasoning tokens
-        [end_reasoning_id] +     # <end_reasoning>
-        answer_tokens +          # answer
-        [eos_id]                # <eos>
+        [end_reasoning_id] +      # <end_reasoning>
+        answer_tokens +           # answer
+        [eos_id]                  # <eos>
     )
-    
-    # Pad to total_sequence_length
-    if len(full_sequence) < total_sequence_length:
-        full_sequence = full_sequence + [tokenizer.pad_token_id] * (total_sequence_length - len(full_sequence))
-    
+
     # Create attention mask (1 for all real tokens, 0 for padding)
-    # --- format_example() attention mask fix ---
-    attention_mask = [0 if t == tokenizer.pad_token_id else 1
-                    for t in full_sequence]
+    attention_mask = [0 if t == tokenizer.pad_token_id else 1 for t in full_sequence]
     
     return {
         "input_ids": full_sequence,
