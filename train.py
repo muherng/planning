@@ -75,18 +75,23 @@ class ExactMatchCallback(TrainerCallback):
 
         exact, total = 0, 0
 
-        for ex in tqdm(self.eval_ds, desc=f"[EM eval @ {state.global_step}]"):
-            # ----- 1. build prompt & generate K‑token reasoning -----
+        for ex in tqdm(self.eval_ds, desc=f"[EM eval @ {state.global_step}]"):
+            # ----- 1. build prompt & (optionally) generate K-token reasoning -----
             prompt = self._build_prompt(ex).to(device).unsqueeze(0)
-            with torch.no_grad():
-                gen1 = model.generate(
-                    prompt,
-                    max_new_tokens=self.k,
-                    pad_token_id=self.PAD,
-                    eos_token_id=self.EOS,
-                    use_cache=True,
-                )
-            reasoning = gen1[0][-self.k :].tolist()
+
+            if self.k > 0:
+                # Generate latent reasoning only when K > 0
+                with torch.no_grad():
+                    gen1 = model.generate(
+                        prompt,
+                        max_new_tokens=self.k,
+                        pad_token_id=self.PAD,
+                        eos_token_id=self.EOS,
+                        use_cache=True,
+                    )
+                reasoning = gen1[0][-self.k :].tolist()
+            else:
+                reasoning = []  # No reasoning tokens when k == 0
 
             # ----- 2. build second input  prompt + reasoning + <end> -----
             start2 = torch.tensor(
@@ -122,8 +127,8 @@ class ExactMatchCallback(TrainerCallback):
 
         acc = exact / total if total else 0.0
         print(
-            f"\n[Step {state.global_step}] exact‑match accuracy "
-            f"on {total} eval examples: {acc:.4%}"
+            f"\n[Step {state.global_step}] exact‑match accuracy "
+            f"on {total} eval examples: {acc:.4%}"
         )
 
         model.train()
@@ -150,6 +155,27 @@ class KStepRolloutTrainer(Trainer):
         EOS_ID = self.processing_class.eos_token_id
         BEGIN_ID = self.processing_class.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
         END_ID = self.processing_class.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
+
+        # ────────────────────────────────────────────────────────────────
+        # Short-circuit path when k_tokens == 0 (no latent reasoning pass)
+        # ────────────────────────────────────────────────────────────────
+        if self.k_tokens == 0:
+            seqs = inputs["input_ids"]                   # (B, L)
+            PAD_ID = self.processing_class.pad_token_id
+            EOS_ID = self.processing_class.eos_token_id
+
+            # Build supervision labels (only supervise answer span + <eos>)
+            new_labels = torch.full_like(seqs, -100)
+            for i, row in enumerate(seqs):
+                end_pos = (row == END_ID).nonzero(as_tuple=True)[0][0]
+                eos_pos = (row == EOS_ID).nonzero(as_tuple=True)[0][0]
+                ans_start = end_pos + 1
+                new_labels[i, ans_start:eos_pos] = row[ans_start:eos_pos]
+                new_labels[i, eos_pos] = EOS_ID
+
+            attn_mask = (seqs != PAD_ID).long()
+            outputs = model(input_ids=seqs, attention_mask=attn_mask, labels=new_labels)
+            return outputs.loss if not return_outputs else (outputs.loss, outputs)
 
         # ---------- 1. isolate prompts ----------
         seqs = inputs["input_ids"]  # (B, TOTAL_LEN)
@@ -242,6 +268,12 @@ def parse_args():
                       help='Directory to save model checkpoints')
     parser.add_argument('--k_tokens', type=int, default=1,
                       help='Number of tokens to generate for reasoning')
+    parser.add_argument('--data_file', type=str, default='data/shortest_paths_train.jsonl',
+                      help='Path to the input data file')
+    parser.add_argument('--use_cached_data', action='store_true',
+                      help='Load pre-formatted dataset if available')
+    parser.add_argument('--save_formatted_data', action='store_true', default=True,
+                      help='Save formatted dataset for future use')
     return parser.parse_args()
 
 # Parse arguments
@@ -313,7 +345,6 @@ SPECIAL_TOKENS = {
     "bos_token": "<bos>",
     "eos_token": "<eos>",
     "pad_token": "<pad>",
-    "sep_token": "<sep>",
     "begin_reasoning_token": "<begin_reasoning>",
     "end_reasoning_token": "<end_reasoning>"
 }
@@ -327,7 +358,6 @@ tokenizer = AutoTokenizer.from_pretrained(
 # Add our special tokens
 special_tokens = {
     "additional_special_tokens": [
-        SPECIAL_TOKENS["sep_token"],
         SPECIAL_TOKENS["begin_reasoning_token"],
         SPECIAL_TOKENS["end_reasoning_token"]
     ]
