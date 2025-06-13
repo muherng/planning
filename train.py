@@ -119,7 +119,24 @@ class ExactMatchCallback(TrainerCallback):
                         eos_token_id=self.EOS,
                         use_cache=True,
                     )
-                reasoning = gen1[0][-self.k :].tolist()
+
+                # Extract the tokens generated AFTER the prompt
+                gen_seq = gen1[0]
+                prompt_len = prompt.shape[1]
+                reasoning_tokens = gen_seq[prompt_len:]
+
+                # Remove EOS and everything after it
+                eos_pos = (reasoning_tokens == self.EOS).nonzero(as_tuple=True)
+                if eos_pos[0].numel() > 0:
+                    reasoning_tokens = reasoning_tokens[: eos_pos[0][0]]
+
+                # Pad to exactly k tokens
+                if reasoning_tokens.shape[0] < self.k:
+                    pad_len = self.k - reasoning_tokens.shape[0]
+                    pad_tensor = torch.full((pad_len,), self.PAD, dtype=reasoning_tokens.dtype, device=device)
+                    reasoning_tokens = torch.cat([reasoning_tokens, pad_tensor])
+
+                reasoning = reasoning_tokens.tolist()
             else:
                 reasoning = []  # No reasoning tokens when k == 0
 
@@ -238,11 +255,30 @@ class KStepRolloutTrainer(Trainer):
         model.train()
         self.processing_class.padding_side = old_side
 
-        # --- keep exactly K new tokens without stripping internal pads ---
+        # --- keep exactly K new tokens (remove early <eos>, pad to k_tokens) ---
         prompt_len = prompt_batch["input_ids"].shape[1]
-        gen_reasonings = [row[prompt_len:] for row in gen]
+        gen_reasonings = []
+        for row in gen:
+            # Tokens the model actually produced (≤ k_tokens by construction)
+            reas = row[prompt_len:]
 
-        # ---------- 3. re‑assemble full sequences ----------
+            # Drop everything from the first EOS onward (including EOS)
+            eos_pos = (reas == EOS_ID).nonzero(as_tuple=True)
+            if eos_pos[0].numel() > 0:
+                reas = reas[: eos_pos[0][0]]
+
+            # Pad to exactly k_tokens
+            if reas.shape[0] < self.k_tokens:
+                pad_len = self.k_tokens - reas.shape[0]
+                reas = torch.cat(
+                    [
+                        reas,
+                        torch.full((pad_len,), PAD_ID, dtype=reas.dtype, device=reas.device),
+                    ]
+                )
+            gen_reasonings.append(reas)
+
+        # ---------- 3. re-assemble full sequences ----------
         new_input_ids = []
         new_labels = []
         for orig, reas in zip(seqs, gen_reasonings):
