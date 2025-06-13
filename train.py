@@ -242,16 +242,28 @@ class KStepRolloutTrainer(Trainer):
         prompt_len = prompt_batch["input_ids"].shape[1]
         gen_reasonings = [row[prompt_len:] for row in gen]
 
-        # ---------- 3. re‑assemble full sequences ----------
+        # ---------- 3. re-assemble full sequences ----------
         new_input_ids = []
         new_labels = []
         for orig, reas in zip(seqs, gen_reasonings):
+            # Safeguard: ensure reasoning span has exactly k_tokens
+            if reas.shape[0] < self.k_tokens:
+                pad_len = self.k_tokens - reas.shape[0]
+                reas = torch.cat(
+                    [
+                        reas,
+                        torch.full((pad_len,), PAD_ID, dtype=reas.dtype, device=reas.device),
+                    ]
+                )
+            elif reas.shape[0] > self.k_tokens:
+                reas = reas[: self.k_tokens]
+
             # locate placeholder start (just after BEGIN_ID)
             start = (orig == BEGIN_ID).nonzero(as_tuple=True)[0][0] + 1
 
             # replace the K pads
             rebuilt = orig.clone()
-            rebuilt[start : start+self.k_tokens] = reas
+            rebuilt[start : start + self.k_tokens] = reas
 
             # build labels: supervise only ANSWER (after END_ID) (+ eos)
             labels = torch.full_like(rebuilt, -100)
