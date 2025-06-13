@@ -242,7 +242,7 @@ class KStepRolloutTrainer(Trainer):
         prompt_len = prompt_batch["input_ids"].shape[1]
         gen_reasonings = [row[prompt_len:] for row in gen]
 
-        # ---------- 3. re-assemble full sequences ----------
+        # ---------- 3. re‑assemble full sequences ----------
         new_input_ids = []
         new_labels = []
         for orig, reas in zip(seqs, gen_reasonings):
@@ -307,8 +307,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train Gemma model on shortest path dataset')
     parser.add_argument('--checkpoint', type=str, default=None,
                       help='Path to model checkpoint directory to resume training from')
-    parser.add_argument('--output_dir', type=str, default='saved_models/gemma-shortest-path',
-                      help='Directory to save model checkpoints')
+    parser.add_argument('--output_dir', type=str, default=None,
+                      help='Directory to save model checkpoints (default: auto-generated with k_tokens)')
     parser.add_argument('--k_tokens', type=int, default=1,
                       help='Number of tokens to generate for reasoning')
     parser.add_argument('--data_file', type=str, default='data/shortest_paths_train.jsonl',
@@ -322,11 +322,17 @@ def parse_args():
 # Parse arguments
 args = parse_args()
 
+# Set default output directory with k_tokens if not specified
+if args.output_dir is None:
+    args.output_dir = f'saved_models/gemma-shortest-path-k{args.k_tokens}'
+
 # Add timestamp to output directory if training from checkpoint
 if args.checkpoint:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     args.output_dir = f"{args.output_dir}_{timestamp}"
     print(f"Training from checkpoint. Output will be saved to: {args.output_dir}")
+
+print(f"Model will be saved to: {args.output_dir}")
 
 # Model and data configuration
 model_id = "google/gemma-2b"
@@ -353,7 +359,7 @@ if ds is None:
     print("Processing dataset from scratch...")
     ds = load_dataset("json", data_files=args.data_file)["train"]
     # Split into train and test with fixed test size
-    ds = ds.train_test_split(test_size=10, seed=42)
+    ds = ds.train_test_split(test_size=30, seed=42)
     
     # Keep a copy of the test set before formatting
     test_ds = ds["test"]
