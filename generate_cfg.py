@@ -28,7 +28,7 @@ def random_expr(max_depth=4, depth=0):
     used to generate the expression.
     """
     # base case: produce an id with probability depending on depth
-    if depth >= max_depth or random.random() < 0.3:
+    if depth >= max_depth or random.random() < 0.01:
         return ["id"], [4]  # rule 4
 
     # choose among the three structural rules
@@ -139,11 +139,13 @@ def sample_expression(max_len, max_depth):
         tokens, _ = random_expr(max_depth=max_depth)
         if len(tokens) <= max_len:
             return tokens
+        print(f"Failed to generate expression under length constraint")
     raise RuntimeError("Failed to generate expression under length constraint")
 
 
 def generate_dataset(n_samples, max_len, max_depth):
-    for _ in range(n_samples):
+    for i in range(n_samples):
+        print(f"Generating example {i+1} of {n_samples}")
         tokens = sample_expression(max_len, max_depth)
         yield encode_example(tokens)
 
@@ -155,8 +157,8 @@ def main():
     out_dir = Path("data") / "cfg"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_file = out_dir / f"arith_wordlen{args.word_len}_train.jsonl"
-    test_file = out_dir / f"arith_wordlen{args.word_len}_test.jsonl"
+    train_file = out_dir / f"arith_depth{args.max_depth}_train.jsonl"
+    test_file = out_dir / f"arith_depth{args.max_depth}_test.jsonl"
 
     print(f"Generating {args.train_samples} training examples…")
     with train_file.open("w") as f:
