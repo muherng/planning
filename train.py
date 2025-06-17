@@ -182,13 +182,41 @@ class ExactMatchCallback(TrainerCallback):
 
 
 class KStepRolloutTrainer(Trainer):
-    def __init__(self, *args, k_tokens=20, tokenizer=None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        k_tokens: int = 20,
+        tokenizer=None,
+        rl_objective: str = "wake_sleep",   # NEW – "reinforce" | "wake_sleep"
+        lambda_pg: float = 0.1,               # NEW – weight on policy-gradient term
+        **kwargs,
+    ):
+        """Extend default trainer with optional REINFORCE objective.
+
+        Args:
+            k_tokens: number of latent-reasoning tokens to sample / supervise.
+            tokenizer: tokenizer used by the data collator (passed explicitly so
+                this class remains usable outside the default training script).
+            rl_objective: either "wake_sleep" (default supervised path) or
+                "reinforce" (policy-gradient on the reasoning tokens).
+            lambda_pg: weight on the policy-gradient term when rl_objective ==
+                "reinforce".
+        """
+
         super().__init__(*args, **kwargs)
+
         self.k_tokens = k_tokens
+        self.rl_objective = rl_objective
+        self.lambda_pg = lambda_pg
+        self.running_R = 0.0  # moving-average reward baseline
+
         if not isinstance(self.data_collator, CustomDataCollator):
             raise ValueError("KStepRolloutTrainer requires CustomDataCollator")
+
         # Ensure tokenizer is available
-        self.processing_class = tokenizer if tokenizer is not None else self.data_collator.processing_class
+        self.processing_class = (
+            tokenizer if tokenizer is not None else self.data_collator.processing_class
+        )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -203,8 +231,14 @@ class KStepRolloutTrainer(Trainer):
         BEGIN_ID = self.processing_class.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
         END_ID = self.processing_class.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
 
+        # ---------------------------------------------------------------------
+        # Guard: REINFORCE objective must have k_tokens > 0
+        # ---------------------------------------------------------------------
+        if self.rl_objective == "reinforce" and self.k_tokens == 0:
+            raise ValueError("REINFORCE needs k_tokens > 0")
+
         # ────────────────────────────────────────────────────────────────
-        # Short-circuit path when k_tokens == 0 (no latent reasoning pass)
+        # Short-circuit path when k_tokens == 0 (wake-sleep objective)
         # ────────────────────────────────────────────────────────────────
         if self.k_tokens == 0:
             seqs = inputs["input_ids"]                   # (B, L)
@@ -223,6 +257,80 @@ class KStepRolloutTrainer(Trainer):
             attn_mask = (seqs != PAD_ID).long()
             outputs = model(input_ids=seqs, attention_mask=attn_mask, labels=new_labels)
             return outputs.loss if not return_outputs else (outputs.loss, outputs)
+
+        # =====================================================================
+        # CASE 2 ───────────────────────────────────────────────────────────────
+        # REINFORCE objective  (policy-gradient on reasoning tokens)
+        # =====================================================================
+        if self.rl_objective == "reinforce":
+            if self.k_tokens == 0:
+                raise ValueError("REINFORCE needs k_tokens > 0")
+
+            # ---------- 1. split prompt vs. reasoning placeholder ----------
+            seqs = inputs["input_ids"]  # (B, L_tot)
+            begin_pos = (seqs == BEGIN_ID).nonzero(as_tuple=True)[1]  # (B,)
+            prompts = [row[:pos + 1] for row, pos in zip(seqs, begin_pos)]
+            prompt_batch = self.processing_class.pad(
+                {"input_ids": prompts}, return_tensors="pt"
+            ).to(model.device)
+
+            # ---------- 2. sample K reasoning tokens WITH gradients ----------
+            model.train()  # ensure grads are on
+            r_tok, logp_r = self._sample_reasoning(
+                model, prompt_batch["input_ids"], self.k_tokens, PAD_ID, EOS_ID
+            )
+
+            # ---------- 3. rebuild full sequence q ⊕ r ⊕ END ⊕ answer ----------
+            full_ids, labels = [], []
+            for orig, r in zip(seqs, r_tok):
+                start = (orig == BEGIN_ID).nonzero(as_tuple=True)[0][0] + 1
+                rebuilt = orig.clone()
+                rebuilt[start : start + self.k_tokens] = r
+
+                lab = torch.full_like(rebuilt, -100)
+                end_pos = (rebuilt == END_ID).nonzero(as_tuple=True)[0][0]
+                ans_start = end_pos + 1
+                eos_pos = (rebuilt == EOS_ID).nonzero(as_tuple=True)[0][0]
+                lab[ans_start:eos_pos] = rebuilt[ans_start:eos_pos]
+                lab[eos_pos] = EOS_ID
+
+                full_ids.append(rebuilt)
+                labels.append(lab)
+
+            full_ids = torch.stack(full_ids)
+            labels = torch.stack(labels)
+            attn_mask = (full_ids != PAD_ID).long()
+
+            # ---------- 4. forward pass for answer CE ----------
+            out = model(input_ids=full_ids, attention_mask=attn_mask, labels=labels)
+            answer_loss = out.loss  # scalar
+
+            # ---------- 5. reward, baseline, advantage ----------
+            with torch.no_grad():
+                reward = (-answer_loss).detach()  # higher is better
+            self.running_R = 0.9 * self.running_R + 0.1 * reward.item()
+            advantage = reward - self.running_R  # broadcast across batch
+
+            # ---------- 6. policy-gradient loss on reasoning ----------
+            policy_loss = -(advantage * logp_r).mean()
+
+            total_loss = answer_loss + self.lambda_pg * policy_loss
+            if state.global_step % 1 == 0:
+                print(f"Total loss: {total_loss}")
+                print(f"Answer loss: {answer_loss}")
+                print(f"Policy loss: {policy_loss}")
+                print(f"Running reward: {self.running_R}")
+                print(f"Advantage: {advantage}")
+                print(f"Logp_r: {logp_r}")
+                print(f"Reward: {reward}")
+                print(f"Full loss: {out.loss}")
+            return (total_loss, out) if return_outputs else total_loss
+
+        # ---------------------------------------------------------------------
+        # fall-through: wake-sleep objective (original supervised pipeline)
+        # ---------------------------------------------------------------------
+        if self.rl_objective not in ("wake_sleep", "reinforce"):
+            raise ValueError(f"Unknown rl_objective: {self.rl_objective}")
 
         # ---------- 1. isolate prompts ----------
         seqs = inputs["input_ids"]  # (B, TOTAL_LEN)
@@ -325,6 +433,53 @@ class KStepRolloutTrainer(Trainer):
 
         return outputs.loss if not return_outputs else (outputs.loss, outputs)
 
+    # ────────────────────────────────────────────────────────────────
+    # helper: sample K reasoning tokens **with gradients on**
+    # ────────────────────────────────────────────────────────────────
+    def _sample_reasoning(self, model, prompt, K, PAD_ID, EOS_ID):
+        """Autoregressively sample *exactly* K tokens from the model while
+        tracking their log-probs so that REINFORCE gradients can flow.
+
+        Args:
+            model: causal-LM.
+            prompt: (B, L) tensor already placed on the correct device.
+            K: number of reasoning tokens to sample.
+            PAD_ID / EOS_ID: token IDs for padding / sentence stop.
+
+        Returns:
+            r_tok  – (B, K) long tensor of sampled tokens.
+            logp_r – (B,)  tensor with sum of log-probs of the sampled tokens
+                      for each example.
+        """
+        device = prompt.device
+        B = prompt.size(0)
+        logp_r = torch.zeros(B, device=device)
+        r_tok = []
+
+        past = None
+        cur = prompt
+        cur_attn = (prompt != PAD_ID).long()
+
+        for _ in range(K):
+            out = model(
+                input_ids=cur,
+                attention_mask=cur_attn,
+                past_key_values=past,
+                use_cache=True,
+            )
+            logits, past = out.logits[:, -1], out.past_key_values
+            probs = torch.softmax(logits, dim=-1)
+            token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+
+            # accumulate log-prob of the sampled token
+            logp_r += torch.log(probs.gather(1, token)).squeeze(1)
+
+            r_tok.append(token)
+            cur, cur_attn = token, torch.ones_like(token)
+
+        r_tok = torch.cat(r_tok, dim=1)  # (B, K)
+        return r_tok, logp_r
+
 class CustomDataCollator(DataCollatorForLanguageModeling):
     def __init__(self, tokenizer, mlm=False):
         super().__init__(tokenizer=tokenizer, mlm=mlm)
@@ -347,7 +502,7 @@ def parse_args():
                       help='Directory to save model checkpoints (default: auto-generated with k_tokens)')
     parser.add_argument('--k_tokens', type=int, default=0,
                       help='Number of tokens to generate for reasoning')
-    parser.add_argument('--data_file', type=str, default='data/shortest_paths_train.jsonl',
+    parser.add_argument('--data_file', type=str, default='data/cfg/arith_depth8_train.jsonl',
                       help='Path to the input data file')
     parser.add_argument('--use_cached_data', action='store_true',
                       help='Load pre-formatted dataset if available')
@@ -589,7 +744,9 @@ trainer = KStepRolloutTrainer(
         ExactMatchCallback(test_ds, tokenizer, k_tokens=args.k_tokens, eval_steps=100)
     ],
     k_tokens=args.k_tokens,  # Number of tokens to generate for reasoning
-    tokenizer=tokenizer  # Pass tokenizer explicitly
+    tokenizer=tokenizer,  # Pass tokenizer explicitly
+    rl_objective="reinforce",   
+    lambda_pg=0.1               
 )
 print("Trainer created")  # Debug print
 
