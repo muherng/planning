@@ -345,7 +345,7 @@ def parse_args():
                       help='Path to model checkpoint directory to resume training from')
     parser.add_argument('--output_dir', type=str, default=None,
                       help='Directory to save model checkpoints (default: auto-generated with k_tokens)')
-    parser.add_argument('--k_tokens', type=int, default=1,
+    parser.add_argument('--k_tokens', type=int, default=0,
                       help='Number of tokens to generate for reasoning')
     parser.add_argument('--data_file', type=str, default='data/shortest_paths_train.jsonl',
                       help='Path to the input data file')
