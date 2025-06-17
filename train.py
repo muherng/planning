@@ -315,7 +315,7 @@ class KStepRolloutTrainer(Trainer):
             policy_loss = -(advantage * logp_r).mean()
 
             total_loss = answer_loss + self.lambda_pg * policy_loss
-            if state.global_step % 1 == 0:
+            if self.state is not None and self.state.global_step % 10 == 0:
                 print(f"Total loss: {total_loss}")
                 print(f"Answer loss: {answer_loss}")
                 print(f"Policy loss: {policy_loss}")
