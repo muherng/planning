@@ -62,7 +62,7 @@ class ExactMatchCallback(TrainerCallback):
         tokenizer,
         k_tokens: int,
         eval_steps: int = 1000,
-        max_answer_tokens: int = 128,
+        max_answer_tokens: int = 2048,
     ):
         # store raw (un‑formatted) dataset; we re‑format on the fly
         self.eval_ds = eval_dataset
@@ -145,11 +145,19 @@ class ExactMatchCallback(TrainerCallback):
                 prompt.tolist()[0] + reasoning + [self.END], device=device
             ).unsqueeze(0)
 
-            # ----- 3. generate answer autoregressively -----
+            # ────────────────────────────────────────────────────────────────
+            # Stop generation early when the model has produced as many
+            # tokens as the gold answer – beyond this point exact-match is
+            # impossible, so we save compute by capping `max_new_tokens`.
+            # ────────────────────────────────────────────────────────────────
+            gold_answer_len = len(
+                self.tok.encode(ex["label"], add_special_tokens=False)
+            )
+
             with torch.no_grad():
                 gen2 = model.generate(
                     start2,
-                    max_new_tokens=self.max_answer,
+                    max_new_tokens=gold_answer_len,  # cap by gold length
                     pad_token_id=self.PAD,
                     eos_token_id=self.EOS,
                     use_cache=True,
@@ -434,48 +442,69 @@ class KStepRolloutTrainer(Trainer):
         return outputs.loss if not return_outputs else (outputs.loss, outputs)
 
     # ────────────────────────────────────────────────────────────────
-    # helper: sample K reasoning tokens **with gradients on**
+    # helper: sample K reasoning tokens **with gradients & sanitation**
     # ────────────────────────────────────────────────────────────────
     def _sample_reasoning(self, model, prompt, K, PAD_ID, EOS_ID):
-        """Autoregressively sample *exactly* K tokens from the model while
-        tracking their log-probs so that REINFORCE gradients can flow.
-
-        Args:
-            model: causal-LM.
-            prompt: (B, L) tensor already placed on the correct device.
-            K: number of reasoning tokens to sample.
-            PAD_ID / EOS_ID: token IDs for padding / sentence stop.
-
-        Returns:
-            r_tok  – (B, K) long tensor of sampled tokens.
-            logp_r – (B,)  tensor with sum of log-probs of the sampled tokens
-                      for each example.
         """
+        Autoregressively sample *exactly* `K` tokens while collecting their
+        log-probabilities.  Any sampled `<eos>` is replaced by `<pad>` and no
+        further log-prob is accumulated for that example.  The returned tensor
+        is always length-`K`, padded where necessary.
+
+        Returns
+        -------
+        r_tok  : (B, K) long
+            Clean reasoning span (no EOS; padded with PAD).
+        logp_r : (B,)   float
+            Sum of log-probs *up to but excluding* the first EOS token for each
+            example.  Gradients flow through this sum.
+        """
+
         device = prompt.device
         B = prompt.size(0)
+
         logp_r = torch.zeros(B, device=device)
         r_tok = []
 
         past = None
-        cur = prompt
+        cur = prompt                      # (B, L₀)
         cur_attn = (prompt != PAD_ID).long()
+        alive = torch.ones(B, dtype=torch.bool, device=device)  # mask of sequences that have not hit EOS
 
         for _ in range(K):
+            # Forward pass (with grad kept)
             out = model(
                 input_ids=cur,
                 attention_mask=cur_attn,
                 past_key_values=past,
                 use_cache=True,
             )
-            logits, past = out.logits[:, -1], out.past_key_values
-            probs = torch.softmax(logits, dim=-1)
-            token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            logits, past = out.logits[:, -1], out.past_key_values  # (B, V)
+            probs = torch.softmax(logits, dim=-1)                 # (B, V)
 
-            # accumulate log-prob of the sampled token
-            logp_r += torch.log(probs.gather(1, token)).squeeze(1)
+            # Sample next token independently for each batch element
+            tok = torch.multinomial(probs, num_samples=1)  # (B, 1)
 
-            r_tok.append(token)
-            cur, cur_attn = token, torch.ones_like(token)
+            # Gather probability of sampled token
+            gathered = probs.gather(1, tok).squeeze(1)  # (B,)
+
+            # Add log-prob only for sequences still alive (i.e., before EOS)
+            logp_r = logp_r + torch.log(gathered) * alive.float()
+
+            # Detect EOS just generated
+            just_eos = (tok.squeeze(1) == EOS_ID)
+
+            # Build a mask for tokens that should become PAD (EOS or already finished)
+            pad_mask = (just_eos | (~alive)).unsqueeze(1)  # (B,1)
+            tok = tok.masked_fill(pad_mask, PAD_ID)
+
+            r_tok.append(tok)
+
+            # Update alive mask AFTER using it for logp
+            alive = alive & (~just_eos)
+
+            # Next-step inputs: sampled token, full attention
+            cur, cur_attn = tok, torch.ones_like(tok)
 
         r_tok = torch.cat(r_tok, dim=1)  # (B, K)
         return r_tok, logp_r
@@ -502,12 +531,14 @@ def parse_args():
                       help='Directory to save model checkpoints (default: auto-generated with k_tokens)')
     parser.add_argument('--k_tokens', type=int, default=0,
                       help='Number of tokens to generate for reasoning')
-    parser.add_argument('--data_file', type=str, default='data/cfg/arith_depth8_train.jsonl',
+    parser.add_argument('--data_file', type=str, default='data/cfg/arith_depth9_10000_train.jsonl',
                       help='Path to the input data file')
     parser.add_argument('--use_cached_data', action='store_true',
                       help='Load pre-formatted dataset if available')
     parser.add_argument('--save_formatted_data', action='store_true', default=True,
                       help='Save formatted dataset for future use')
+    parser.add_argument('--train_mode', type=str, default='wake_sleep',
+                      help='Training mode: wake_sleep or reinforce')
     return parser.parse_args()
 
 # Parse arguments
@@ -515,7 +546,7 @@ args = parse_args()
 
 # Set default output directory with k_tokens if not specified
 if args.output_dir is None:
-    args.output_dir = f'saved_models/gemma-shortest-path-k{args.k_tokens}'
+    args.output_dir = f'saved_models/depth9/gemma-cfg-k{args.k_tokens}-{args.train_mode}'
 
 # Add timestamp to output directory if training from checkpoint
 if args.checkpoint:
@@ -745,7 +776,7 @@ trainer = KStepRolloutTrainer(
     ],
     k_tokens=args.k_tokens,  # Number of tokens to generate for reasoning
     tokenizer=tokenizer,  # Pass tokenizer explicitly
-    rl_objective="reinforce",   
+    rl_objective=args.train_mode,   
     lambda_pg=0.1               
 )
 print("Trainer created")  # Debug print

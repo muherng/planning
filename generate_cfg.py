@@ -157,8 +157,8 @@ def main():
     out_dir = Path("data") / "cfg"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train_file = out_dir / f"arith_depth{args.max_depth}_train.jsonl"
-    test_file = out_dir / f"arith_depth{args.max_depth}_test.jsonl"
+    train_file = out_dir / f"arith_depth{args.max_depth}_{args.train_samples}_train.jsonl"
+    test_file = out_dir / f"arith_depth{args.max_depth}_{args.test_samples}_test.jsonl"
 
     print(f"Generating {args.train_samples} training examples…")
     with train_file.open("w") as f:
