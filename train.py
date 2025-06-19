@@ -126,9 +126,9 @@ class ExactMatchCallback(TrainerCallback):
                 reasoning_tokens = gen_seq[prompt_len:]
 
                 # Remove EOS and everything after it
-                eos_pos = (reasoning_tokens == self.EOS).nonzero(as_tuple=True)
-                if eos_pos[0].numel() > 0:
-                    reasoning_tokens = reasoning_tokens[: eos_pos[0][0]]
+                eos_positions = (reasoning_tokens == self.EOS).nonzero(as_tuple=True)[0]
+                eos_pos = eos_positions[-1].item()
+                reasoning_tokens = reasoning_tokens[: eos_pos]
 
                 # Pad to exactly k tokens
                 if reasoning_tokens.shape[0] < self.k:
@@ -283,7 +283,7 @@ class KStepRolloutTrainer(Trainer):
             ).to(model.device)
 
             # ---------- 2. sample K reasoning tokens WITH gradients ----------
-            model.train()  # ensure grads are on
+            #model.train()  # ensure grads are on
             r_tok, logp_r = self._sample_reasoning(
                 model, prompt_batch["input_ids"], self.k_tokens, PAD_ID, EOS_ID
             )
@@ -379,9 +379,9 @@ class KStepRolloutTrainer(Trainer):
             reas = row[prompt_len:]
 
             # Drop everything from the first EOS onward (including EOS)
-            eos_pos = (reas == EOS_ID).nonzero(as_tuple=True)
-            if eos_pos[0].numel() > 0:
-                reas = reas[: eos_pos[0][0]]
+            eos_positions = (reas == EOS_ID).nonzero(as_tuple=True)[0]
+            eos_pos = eos_positions[-1].item()
+            reas = reas[: eos_pos]
 
             # Pad to exactly k_tokens
             if reas.shape[0] < self.k_tokens:
@@ -421,7 +421,8 @@ class KStepRolloutTrainer(Trainer):
             labels = torch.full_like(rebuilt, -100)
             end_pos = (rebuilt == END_ID).nonzero(as_tuple=True)[0][0]
             ans_start = end_pos + 1
-            eos_pos = (rebuilt == EOS_ID).nonzero(as_tuple=True)[0][0]
+            eos_positions = (rebuilt == EOS_ID).nonzero(as_tuple=True)[0]
+            eos_pos = eos_positions[-1].item()
             labels[ans_start : eos_pos] = rebuilt[ans_start : eos_pos]
             labels[eos_pos] = EOS_ID  # supervise eos token
 
@@ -446,68 +447,66 @@ class KStepRolloutTrainer(Trainer):
     # ────────────────────────────────────────────────────────────────
     def _sample_reasoning(self, model, prompt, K, PAD_ID, EOS_ID):
         """
-        Autoregressively sample *exactly* `K` tokens while collecting their
-        log-probabilities.  Any sampled `<eos>` is replaced by `<pad>` and no
-        further log-prob is accumulated for that example.  The returned tensor
-        is always length-`K`, padded where necessary.
+        Memory-friendly version:
+        • Sampling happens under torch.no_grad()  → no KV activations kept.
+        • A single gradient pass then scores r by masking labels to the K
+            reasoning positions.
 
         Returns
         -------
-        r_tok  : (B, K) long
-            Clean reasoning span (no EOS; padded with PAD).
-        logp_r : (B,)   float
-            Sum of log-probs *up to but excluding* the first EOS token for each
-            example.  Gradients flow through this sum.
+        r_tok  : (B,K) long  – reasoning tokens (EOS replaced by PAD, length=K)
+        logp_r : (B,)  float – sum log-probs of those K tokens (grads flow)
         """
+        B, device = prompt.size(0), prompt.device
 
-        device = prompt.device
-        B = prompt.size(0)
+        # -----------------------------------------------------------
+        # 1)  SAMPLE  (no gradients, no past kept in graph)
+        # -----------------------------------------------------------
+        with torch.no_grad():
+            sampled = []
+            cur, cur_attn, past = prompt, (prompt != PAD_ID).long(), None
+            alive = torch.ones(B, dtype=torch.bool, device=device)
 
-        logp_r = torch.zeros(B, device=device)
-        r_tok = []
+            for _ in range(K):
+                out         = model(input_ids=cur,
+                                    attention_mask=cur_attn,
+                                    past_key_values=past,
+                                    use_cache=True)
+                logits, past = out.logits[:, -1], out.past_key_values
+                tok          = torch.multinomial(torch.softmax(logits, -1), 1)  # (B,1)
 
-        past = None
-        cur = prompt                      # (B, L₀)
-        cur_attn = (prompt != PAD_ID).long()
-        alive = torch.ones(B, dtype=torch.bool, device=device)  # mask of sequences that have not hit EOS
+                # replace EOS by PAD, keep track of finished rows
+                just_eos   = tok.squeeze(1).eq(EOS_ID)
+                tok[just_eos] = PAD_ID
+                alive &= ~just_eos
+                sampled.append(tok)
 
-        for _ in range(K):
-            # Forward pass (with grad kept)
-            out = model(
-                input_ids=cur,
-                attention_mask=cur_attn,
-                past_key_values=past,
-                use_cache=True,
-            )
-            logits, past = out.logits[:, -1], out.past_key_values  # (B, V)
-            probs = torch.softmax(logits, dim=-1)                 # (B, V)
+                cur, cur_attn = tok, torch.ones_like(tok)
 
-            # Sample next token independently for each batch element
-            tok = torch.multinomial(probs, num_samples=1)  # (B, 1)
+        r_tok = torch.cat(sampled, dim=1)                  # (B,K)
 
-            # Gather probability of sampled token
-            gathered = probs.gather(1, tok).squeeze(1)  # (B,)
+        # -----------------------------------------------------------
+        # 2)  SCORE the sampled tokens (gradients ON)
+        #     We build input = prompt ⊕ r_tok[:-1]
+        #             label =      prompt pads ⊕ r_tok
+        # -----------------------------------------------------------
+        # inputs are prompt plus first K-1 sampled tokens
+        inp  = torch.cat([prompt, r_tok[:, :-1]], dim=1)   # (B, L₀+K-1)
+        # labels are -100 everywhere except the K reasoning positions
+        lab  = torch.full_like(inp, -100)
+        lab[:, -K:] = r_tok                                # supervise exactly K tokens
 
-            # Add log-prob only for sequences still alive (i.e., before EOS)
-            logp_r = logp_r + torch.log(gathered) * alive.float()
+        attn = (inp != PAD_ID).long()
+        out  = model(input_ids=inp,
+                    attention_mask=attn,
+                    labels=lab)
 
-            # Detect EOS just generated
-            just_eos = (tok.squeeze(1) == EOS_ID)
+        # cross-entropy is averaged over *non-masked* tokens;
+        # multiply by K to recover the sum of –log p over those tokens
+        nll_per_batch = out.loss * K                       # (scalar tensor)
+        logp_r = -nll_per_batch                           # want +log p
 
-            # Build a mask for tokens that should become PAD (EOS or already finished)
-            pad_mask = (just_eos | (~alive)).unsqueeze(1)  # (B,1)
-            tok = tok.masked_fill(pad_mask, PAD_ID)
-
-            r_tok.append(tok)
-
-            # Update alive mask AFTER using it for logp
-            alive = alive & (~just_eos)
-
-            # Next-step inputs: sampled token, full attention
-            cur, cur_attn = tok, torch.ones_like(tok)
-
-        r_tok = torch.cat(r_tok, dim=1)  # (B, K)
-        return r_tok, logp_r
+        return r_tok, logp_r    
 
 class CustomDataCollator(DataCollatorForLanguageModeling):
     def __init__(self, tokenizer, mlm=False):
@@ -539,14 +538,23 @@ def parse_args():
                       help='Save formatted dataset for future use')
     parser.add_argument('--train_mode', type=str, default='wake_sleep',
                       help='Training mode: wake_sleep or reinforce')
+    # NEW – allow choosing any HF causal-LM model (e.g. "gpt2", "TinyLlama")
+    parser.add_argument('--model_id', type=str, default='google/gemma-2b',
+                      help='HuggingFace model ID to fine-tune (default: google/gemma-2b)')
+    # NEW – toggle bf16 precision (disable for small models like GPT-2)
+    parser.add_argument('--bf16', action='store_true', default=False,
+                      help='Enable bfloat16 mixed-precision training')
     return parser.parse_args()
 
 # Parse arguments
 args = parse_args()
 
-# Set default output directory with k_tokens if not specified
+# Derive a short model tag (last path component without slashes)
+model_tag = os.path.basename(args.model_id)
+
+# Auto-generate an output directory if the user did not specify one
 if args.output_dir is None:
-    args.output_dir = f'saved_models/depth9/gemma-cfg-k{args.k_tokens}-{args.train_mode}'
+    args.output_dir = f'saved_models/depth9/{model_tag}-cfg-k{args.k_tokens}-{args.train_mode}'
 
 # Add timestamp to output directory if training from checkpoint
 if args.checkpoint:
@@ -557,8 +565,9 @@ if args.checkpoint:
 print(f"Model will be saved to: {args.output_dir}")
 
 # Model and data configuration
-model_id = "google/gemma-2b"
-max_length = 100000
+model_id = args.model_id  # ← comes from CLI; fallback defined in argparse
+# (optionally) sanity-check: warn if sequence length may exceed model capacity
+max_length = 100000  # not currently used – kept for backwards compatibility
 batch_size = 4
 gradient_accumulation_steps = 4
 
@@ -660,6 +669,10 @@ special_tokens = {
 }
 tokenizer.add_special_tokens(special_tokens)
 
+# Some models (e.g., GPT-2) do not have a BOS token; add one if missing
+if tokenizer.bos_token_id is None:
+    tokenizer.add_special_tokens({"bos_token": SPECIAL_TOKENS["bos_token"]})
+
 # Debug prints for special tokens
 print("\nVerifying special tokens:")
 for token in special_tokens["additional_special_tokens"]:
@@ -676,7 +689,7 @@ for token_name, token in SPECIAL_TOKENS.items():
 # Resize model's token embeddings to match new tokenizer
 model = AutoModelForCausalLM.from_pretrained(
     model_id if args.checkpoint is None else args.checkpoint,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=(torch.bfloat16 if args.bf16 else None),
     device_map="auto"
 )
 model.resize_token_embeddings(len(tokenizer))
@@ -758,7 +771,7 @@ training_args = TrainingArguments(
     weight_decay=0.01,
     warmup_steps=100,
     lr_scheduler_type="cosine",
-    bf16=True,
+    bf16=args.bf16,
     report_to="tensorboard",
     save_total_limit=3,
 )
