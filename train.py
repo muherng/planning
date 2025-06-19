@@ -257,9 +257,11 @@ class KStepRolloutTrainer(Trainer):
             new_labels = torch.full_like(seqs, -100)
             for i, row in enumerate(seqs):
                 end_pos = (row == END_ID).nonzero(as_tuple=True)[0][0]
-                eos_pos = (row == EOS_ID).nonzero(as_tuple=True)[0][0]
+                eos_positions = (row == EOS_ID).nonzero(as_tuple=True)[0]
+                eos_pos = eos_positions[-1].item()  # LAST <eos>
                 ans_start = end_pos + 1
-                new_labels[i, ans_start:eos_pos] = row[ans_start:eos_pos]
+                if eos_pos > ans_start:  # guard against empty slice
+                    new_labels[i, ans_start:eos_pos] = row[ans_start:eos_pos]
                 new_labels[i, eos_pos] = EOS_ID
 
             attn_mask = (seqs != PAD_ID).long()
@@ -297,9 +299,11 @@ class KStepRolloutTrainer(Trainer):
 
                 lab = torch.full_like(rebuilt, -100)
                 end_pos = (rebuilt == END_ID).nonzero(as_tuple=True)[0][0]
+                eos_positions = (rebuilt == EOS_ID).nonzero(as_tuple=True)[0]
+                eos_pos = eos_positions[-1].item()
                 ans_start = end_pos + 1
-                eos_pos = (rebuilt == EOS_ID).nonzero(as_tuple=True)[0][0]
-                lab[ans_start:eos_pos] = rebuilt[ans_start:eos_pos]
+                if eos_pos > ans_start:
+                    lab[ans_start:eos_pos] = rebuilt[ans_start:eos_pos]
                 lab[eos_pos] = EOS_ID
 
                 full_ids.append(rebuilt)
@@ -332,6 +336,12 @@ class KStepRolloutTrainer(Trainer):
                 print(f"Logp_r: {logp_r}")
                 print(f"Reward: {reward}")
                 print(f"Full loss: {out.loss}")
+
+            # DEBUG: verify we supervise some tokens (should be >0)
+            if self.state is None or (self.state.global_step if self.state.global_step is not None else 0) < 3:
+                supervised_tokens = (labels != -100).sum().item()
+                print(f"[DEBUG] supervised tokens in batch: {supervised_tokens}")
+
             return (total_loss, out) if return_outputs else total_loss
 
         # ---------------------------------------------------------------------
@@ -418,16 +428,17 @@ class KStepRolloutTrainer(Trainer):
             rebuilt[start : start + self.k_tokens] = reas
 
             # build labels: supervise only ANSWER (after END_ID) (+ eos)
-            labels = torch.full_like(rebuilt, -100)
+            lab = torch.full_like(rebuilt, -100)
             end_pos = (rebuilt == END_ID).nonzero(as_tuple=True)[0][0]
-            ans_start = end_pos + 1
             eos_positions = (rebuilt == EOS_ID).nonzero(as_tuple=True)[0]
             eos_pos = eos_positions[-1].item()
-            labels[ans_start : eos_pos] = rebuilt[ans_start : eos_pos]
-            labels[eos_pos] = EOS_ID  # supervise eos token
+            ans_start = end_pos + 1
+            if eos_pos > ans_start:
+                lab[ans_start:eos_pos] = rebuilt[ans_start:eos_pos]
+            lab[eos_pos] = EOS_ID  # supervise eos token
 
             new_input_ids.append(rebuilt)
-            new_labels.append(labels)
+            new_labels.append(lab)
 
         input_ids = torch.stack(new_input_ids)
         labels = torch.stack(new_labels)
@@ -439,6 +450,11 @@ class KStepRolloutTrainer(Trainer):
             attention_mask=attn_mask,
             labels=labels
         )
+
+        # DEBUG: verify we supervise some tokens (should be >0)
+        if self.state is None or (self.state.global_step if self.state.global_step is not None else 0) < 3:
+            supervised_tokens = (labels != -100).sum().item()
+            print(f"[DEBUG] supervised tokens in batch: {supervised_tokens}")
 
         return outputs.loss if not return_outputs else (outputs.loss, outputs)
 
@@ -669,8 +685,9 @@ special_tokens = {
 }
 tokenizer.add_special_tokens(special_tokens)
 
-# Some models (e.g., GPT-2) do not have a BOS token; add one if missing
-if tokenizer.bos_token_id is None:
+# Ensure BOS and EOS are distinct. GPT-2 uses the same id for both, which
+# breaks our logic. If they collide, we create a new dedicated BOS token.
+if tokenizer.bos_token_id is None or tokenizer.bos_token_id == tokenizer.eos_token_id:
     tokenizer.add_special_tokens({"bos_token": SPECIAL_TOKENS["bos_token"]})
 
 # Debug prints for special tokens
