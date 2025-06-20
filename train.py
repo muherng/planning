@@ -127,8 +127,9 @@ class ExactMatchCallback(TrainerCallback):
 
                 # Remove EOS and everything after it
                 eos_positions = (reasoning_tokens == self.EOS).nonzero(as_tuple=True)[0]
-                eos_pos = eos_positions[-1].item()
-                reasoning_tokens = reasoning_tokens[: eos_pos]
+                if eos_positions.numel() > 0:
+                    eos_pos = eos_positions[-1].item()
+                    reasoning_tokens = reasoning_tokens[: eos_pos]
 
                 # Pad to exactly k tokens
                 if reasoning_tokens.shape[0] < self.k:
@@ -327,15 +328,25 @@ class KStepRolloutTrainer(Trainer):
             policy_loss = -(advantage * logp_r).mean()
 
             total_loss = answer_loss + self.lambda_pg * policy_loss
+            # -----------------------------------------------------------------
+            # Compact, machine-readable logging every 10 optimisation steps
+            # -----------------------------------------------------------------
             if self.state is not None and self.state.global_step % 10 == 0:
-                print(f"Total loss: {total_loss}")
-                print(f"Answer loss: {answer_loss}")
-                print(f"Policy loss: {policy_loss}")
-                print(f"Running reward: {self.running_R}")
-                print(f"Advantage: {advantage}")
-                print(f"Logp_r: {logp_r}")
-                print(f"Reward: {reward}")
-                print(f"Full loss: {out.loss}")
+                # Gather core statistics (convert tiny tensors to Python scalars)
+                metrics = {
+                    "step": int(self.state.global_step),
+                    "total_loss": float(total_loss.item()),      # CE + λ·PG
+                    "answer_ce": float(answer_loss.item()),
+                    "policy_loss": float(policy_loss.item()),
+                    "lambda_pg": self.lambda_pg,
+                    "reward": float(reward.item()),              # − answer_ce
+                    "baseline_R": float(self.running_R),         # moving avg
+                    "advantage": float(advantage.item()),
+                    "logp_r": float(logp_r.item()) if torch.is_tensor(logp_r) else float(logp_r),
+                }
+
+                # Emit as a single JSON line – easy to grep or parse later
+                print("[reinforce] " + json.dumps(metrics))
 
             # DEBUG: verify we supervise some tokens (should be >0)
             if self.state is None or (self.state.global_step if self.state.global_step is not None else 0) < 3:
@@ -390,8 +401,9 @@ class KStepRolloutTrainer(Trainer):
 
             # Drop everything from the first EOS onward (including EOS)
             eos_positions = (reas == EOS_ID).nonzero(as_tuple=True)[0]
-            eos_pos = eos_positions[-1].item()
-            reas = reas[: eos_pos]
+            if eos_positions.numel() > 0:
+                eos_pos = eos_positions[-1].item()
+                reas = reas[: eos_pos]
 
             # Pad to exactly k_tokens
             if reas.shape[0] < self.k_tokens:
