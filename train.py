@@ -267,6 +267,22 @@ class KStepRolloutTrainer(Trainer):
 
             attn_mask = (seqs != PAD_ID).long()
             outputs = model(input_ids=seqs, attention_mask=attn_mask, labels=new_labels)
+
+            # ─────── Log + print answer CE (wake-sleep, k=0) ───────
+            try:
+                self.log({"answer_ce": float(outputs.loss.item())})
+            except AttributeError:
+                pass
+
+            if self.state is not None and self.state.global_step % 10 == 0:
+                print(
+                    "[wake_sleep] "
+                    + json.dumps({
+                        "step": int(self.state.global_step),
+                        "answer_ce": float(outputs.loss.item()),
+                    })
+                )
+
             return outputs.loss if not return_outputs else (outputs.loss, outputs)
 
         # =====================================================================
@@ -320,7 +336,7 @@ class KStepRolloutTrainer(Trainer):
 
             # ---------- 5. reward, baseline, advantage ----------
             with torch.no_grad():
-                reward = (-answer_loss).detach()  # higher is better
+                reward = (-answer_loss).detach()  # higher reward = lower CE
             self.running_R = 0.9 * self.running_R + 0.1 * reward.item()
             advantage = reward - self.running_R  # broadcast across batch
 
@@ -328,6 +344,18 @@ class KStepRolloutTrainer(Trainer):
             policy_loss = -(advantage * logp_r).mean()
 
             total_loss = answer_loss + self.lambda_pg * policy_loss
+
+            # Log answer cross-entropy so it can be compared directly
+            # with the wake-sleep objective (which reports only CE).
+            # This metric is aggregated by HF Trainer and will show up
+            # in TensorBoard or the progress bar under the key
+            # "answer_ce".
+            try:
+                self.log({"answer_ce": float(answer_loss.item())})
+            except AttributeError:
+                # `self.log` may not exist in older Trainer versions – ignore.
+                pass
+
             # -----------------------------------------------------------------
             # Compact, machine-readable logging every 10 optimisation steps
             # -----------------------------------------------------------------
@@ -463,6 +491,23 @@ class KStepRolloutTrainer(Trainer):
             labels=labels
         )
 
+        answer_loss_ws = outputs.loss
+
+        # ─────── Log + print answer CE (wake-sleep, k>0) ───────
+        try:
+            self.log({"answer_ce": float(answer_loss_ws.item())})
+        except AttributeError:
+            pass
+
+        if self.state is not None and self.state.global_step % 10 == 0:
+            print(
+                "[wake_sleep] "
+                + json.dumps({
+                    "step": int(self.state.global_step),
+                    "answer_ce": float(answer_loss_ws.item()),
+                })
+            )
+
         # DEBUG: verify we supervise some tokens (should be >0)
         if self.state is None or (self.state.global_step if self.state.global_step is not None else 0) < 3:
             supervised_tokens = (labels != -100).sum().item()
@@ -582,7 +627,7 @@ model_tag = os.path.basename(args.model_id)
 
 # Auto-generate an output directory if the user did not specify one
 if args.output_dir is None:
-    args.output_dir = f'saved_models/depth9/{model_tag}-cfg-k{args.k_tokens}-{args.train_mode}'
+    args.output_dir = f'saved_models/depth6/{model_tag}-cfg-k{args.k_tokens}-{args.train_mode}'
 
 # Add timestamp to output directory if training from checkpoint
 if args.checkpoint:
