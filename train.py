@@ -15,11 +15,25 @@ from pathlib import Path
 from datetime import datetime
 from tqdm import tqdm
 import json
+import torch.nn as nn  # NEW – for hidden-state reuse wrapper
 
 # Suppress the specific deprecation warning about Trainer.tokenizer
 warnings.filterwarnings("ignore", message="Trainer.tokenizer is now deprecated")
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+# ────────────────────────────────────────────────────────────────
+# SPECIAL TOKENS (shared across all training modes)
+# ────────────────────────────────────────────────────────────────
+
+SPECIAL_TOKENS = {
+    "bos_token": "<bos>",
+    "eos_token": "<eos>",
+    "pad_token": "<pad>",
+    "begin_reasoning_token": "<begin_reasoning>",
+    "end_reasoning_token": "<end_reasoning>",
+    "latent_token": "<latent>"  # used by latent chain-of-thought baseline
+}
 
 def get_formatted_dataset_path(data_file, k_tokens):
     """Generate path for formatted dataset based on input file and k_tokens."""
@@ -513,7 +527,10 @@ class KStepRolloutTrainer(Trainer):
             supervised_tokens = (labels != -100).sum().item()
             print(f"[DEBUG] supervised tokens in batch: {supervised_tokens}")
 
-        return outputs.loss if not return_outputs else (outputs.loss, outputs)
+        if answer_loss_ws is None:
+            raise RuntimeError("No answer tokens supervised — check dataset formatting.")
+
+        return answer_loss_ws if not return_outputs else (answer_loss_ws, outputs)
 
     # ────────────────────────────────────────────────────────────────
     # helper: sample K reasoning tokens **with gradients & sanitation**
@@ -587,13 +604,174 @@ class CustomDataCollator(DataCollatorForLanguageModeling):
         self.processing_class = tokenizer
 
     def torch_call(self, examples):
-        # Dynamically pad to the longest sequence in the current batch
+        # Separate labels (if any) before using tokenizer.pad (which doesn't
+        # expect arbitrary keys).
+        labels_list = [ex.pop("labels", None) for ex in examples]
+
+        # Dynamically pad the remaining fields to the longest sequence
         batch = self.processing_class.pad(
             examples,
             padding="longest",
-            return_tensors="pt"
+            return_tensors="pt",
         )
+
+        # Re-insert padded labels (if they were provided)
+        if any(l is not None for l in labels_list):
+            max_len = max(len(l) for l in labels_list)
+            padded_labels = [
+                l + [-100] * (max_len - len(l)) if l is not None else [-100] * max_len
+                for l in labels_list
+            ]
+            batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
+
         return batch
+
+# ────────────────────────────────────────────────────────────────
+# Hidden-state reuse wrapper & minimal trainer (latent CoT baseline)
+# ────────────────────────────────────────────────────────────────
+
+# Global placeholder; populated after tokenizer instantiation
+LATENT_ID = None
+
+class HiddenStateReuseWrapper(nn.Module):
+    """Coconut-style loop: feeds previous hidden state into K <latent> slots."""
+
+    def __init__(self, base_lm: nn.Module, latent_id: int, k_tokens: int):
+        super().__init__()
+        self.lm = base_lm
+        self.latent_id = latent_id
+        self.k = k_tokens
+        self.proj = nn.Linear(base_lm.config.hidden_size, base_lm.config.hidden_size, bias=False)
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        if input_ids is None:
+            raise ValueError("input_ids required for HiddenStateReuseWrapper")
+
+        device = input_ids.device
+
+        # find first latent token index for each sequence
+        latent_starts = (input_ids == self.latent_id).float().argmax(-1)
+
+        past = None
+        batch_size, hidden = input_ids.size(0), self.lm.config.hidden_size
+
+        # 1) prefix (up to first latent slot)
+        max_pref = latent_starts.max().item()
+        if max_pref > 0:
+            prefix_ids = input_ids[:, :max_pref]
+            prefix_mask = attention_mask[:, :max_pref] if attention_mask is not None else None
+            o = self.lm(input_ids=prefix_ids,
+                        attention_mask=prefix_mask,
+                        use_cache=True,
+                        past_key_values=None,
+                        labels=None)
+            past = o.past_key_values
+            last_h = o.last_hidden_state[:, -1]
+        else:
+            last_h = torch.zeros(batch_size, hidden, device=device)
+
+        # 2) iterate over K latent placeholders
+        for _ in range(self.k):
+            emb = self.proj(last_h).unsqueeze(1)
+            o = self.lm(inputs_embeds=emb,
+                        attention_mask=None,
+                        use_cache=True,
+                        past_key_values=past,
+                        labels=None)
+            past = o.past_key_values
+            last_h = o.last_hidden_state[:, -1]
+
+        # 3) tail (END + answer) – supervise here
+        tail_ids = input_ids[:, max_pref + self.k :]
+        tail_mask = attention_mask[:, max_pref + self.k :] if attention_mask is not None else None
+
+        # Slice labels to match the tail sequence length
+        labels_tail = None
+        if labels is not None:
+            labels_tail = labels[:, max_pref + self.k :]
+
+        if tail_ids.size(1):
+            o = self.lm(input_ids=tail_ids,
+                        attention_mask=tail_mask,
+                        use_cache=False,
+                        past_key_values=past,
+                        labels=labels_tail)
+            loss = o.loss
+        else:
+            loss = None
+
+        if loss is None:
+            raise RuntimeError("No answer tokens supervised — check dataset formatting.")
+
+        return loss if labels is None else loss
+
+    # ---------------------------------------------------------------------
+    # Convenience: expose config + save_pretrained so that Trainer utilities
+    # continue to work seamlessly with the wrapper.
+    # ---------------------------------------------------------------------
+
+    @property
+    def config(self):
+        return self.lm.config
+
+    def save_pretrained(self, *args, **kwargs):
+        """Delegate saving to the underlying base LM."""
+        return self.lm.save_pretrained(*args, **kwargs)
+
+class MinimalCoTTrainer(Trainer):
+    """Trainer variant used when --train_mode latentreuse is selected."""
+
+    def compute_loss(self, model, inputs, return_outputs=False, **_):
+        ids = inputs["input_ids"]
+        mask = inputs.get("attention_mask")
+        labels = inputs.get("labels")
+        loss = model(input_ids=ids, attention_mask=mask, labels=labels)
+        return (loss, None) if return_outputs else loss
+
+# ────────────────────────────────────────────────────────────────
+# Alternative formatter for latent-reuse baseline
+# ────────────────────────────────────────────────────────────────
+
+def format_example_latent(ex):
+    """Format a single example for the hidden-state reuse baseline.
+
+    Sequence layout:
+        <bos> question <begin_reasoning> <latent>×K <end_reasoning> answer <eos>
+
+    Only the answer span (and terminal <eos>) is supervised; everything before
+    that has label -100 so that gradient updates focus on the answer tokens.
+    """
+
+    question = f"{SYSTEM}\n\n{PROMPT.format(**ex)}"
+    answer = TARGET.format(**ex)
+
+    question_ids = tokenizer.encode(question, add_special_tokens=False)
+    answer_ids = tokenizer.encode(answer, add_special_tokens=False)
+
+    bos = [tokenizer.bos_token_id]
+    begin_id = tokenizer.encode(SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False)[0]
+    end_id = tokenizer.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
+
+    ids = (
+        bos +
+        question_ids +
+        [begin_id] +
+        [LATENT_ID] * args.k_tokens +
+        [end_id] +
+        answer_ids +
+        [tokenizer.eos_token_id]
+    )
+
+    # Labels: supervise only answer tokens + final <eos>
+    labels = [-100] * (len(ids) - len(answer_ids) - 1) + answer_ids + [tokenizer.eos_token_id]
+
+    attn = [1] * len(ids)
+
+    return {
+        "input_ids": ids,
+        "attention_mask": attn,
+        "labels": labels,
+    }
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Gemma model on shortest path dataset')
@@ -610,7 +788,7 @@ def parse_args():
     parser.add_argument('--save_formatted_data', action='store_true', default=True,
                       help='Save formatted dataset for future use')
     parser.add_argument('--train_mode', type=str, default='wake_sleep',
-                      help='Training mode: wake_sleep or reinforce')
+                      help='Training mode: wake_sleep | reinforce | latentreuse')
     # NEW – allow choosing any HF causal-LM model (e.g. "gpt2", "TinyLlama")
     parser.add_argument('--model_id', type=str, default='google/gemma-2b',
                       help='HuggingFace model ID to fine-tune (default: google/gemma-2b)')
@@ -717,15 +895,6 @@ else:
     total_sequence_length = sample_length
     print(f"Sequence length from cached data: {total_sequence_length}")
 
-# Add special tokens for our task
-SPECIAL_TOKENS = {
-    "bos_token": "<bos>",
-    "eos_token": "<eos>",
-    "pad_token": "<pad>",
-    "begin_reasoning_token": "<begin_reasoning>",
-    "end_reasoning_token": "<end_reasoning>"
-}
-
 # Load tokenizer and model
 tokenizer = AutoTokenizer.from_pretrained(
     model_id if args.checkpoint is None else args.checkpoint,
@@ -737,7 +906,8 @@ special_tokens = {
     "pad_token": SPECIAL_TOKENS["pad_token"],
     "additional_special_tokens": [
         SPECIAL_TOKENS["begin_reasoning_token"],
-        SPECIAL_TOKENS["end_reasoning_token"]
+        SPECIAL_TOKENS["end_reasoning_token"],
+        SPECIAL_TOKENS["latent_token"]  # NEW
     ]
 }
 tokenizer.add_special_tokens(special_tokens)
@@ -760,6 +930,9 @@ for token_name, token in SPECIAL_TOKENS.items():
     print(f"{token_name} ID: {token_id}")
     print(f"{token_name} decoded: {tokenizer.decode([token_id])}")
 
+# Populate global LATENT_ID once specials are added
+LATENT_ID = tokenizer.encode(SPECIAL_TOKENS["latent_token"], add_special_tokens=False)[0]
+
 # Resize model's token embeddings to match new tokenizer
 model = AutoModelForCausalLM.from_pretrained(
     model_id if args.checkpoint is None else args.checkpoint,
@@ -768,6 +941,10 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 model.resize_token_embeddings(len(tokenizer))
 model.config.pad_token_id = tokenizer.pad_token_id  # ensure model knows the new pad token
+
+# Wrap with hidden-state reuse if requested
+if args.train_mode == "latentreuse":
+    model = HiddenStateReuseWrapper(model, LATENT_ID, args.k_tokens)
 
 def format_example(ex):
     # Format the basic sequence: question + separator + answer
@@ -817,10 +994,13 @@ cached_dataset_loaded = args.use_cached_data and 'input_ids' in ds['train'].colu
 
 if not cached_dataset_loaded:
     print("Formatting dataset...")
-    ds = ds.map(format_example, remove_columns=["input", "label"])
-    
-    # Save formatted dataset if requested
-    if args.save_formatted_data:
+    if args.train_mode == "latentreuse":
+        ds = ds.map(format_example_latent, remove_columns=["input", "label"])
+    else:
+        ds = ds.map(format_example, remove_columns=["input", "label"])
+
+    # Skip caching for latent reuse to avoid format mismatch
+    if args.train_mode != "latentreuse" and args.save_formatted_data:
         save_formatted_dataset(ds, args.data_file, args.k_tokens)
 
 # Create a separate formatted dataset for evaluation
@@ -851,22 +1031,32 @@ training_args = TrainingArguments(
 )
 
 # Initialize trainer with k-token rollout
-print("Creating trainer with KStepRolloutTrainer")
-trainer = KStepRolloutTrainer(
-    model=model,
-    args=training_args,
-    train_dataset=ds["train"],
-    eval_dataset=ds["test"],
-    data_collator=CustomDataCollator(tokenizer=tokenizer, mlm=False),
-    callbacks=[
-        ExactMatchCallback(test_ds, tokenizer, k_tokens=args.k_tokens, eval_steps=100)
-    ],
-    k_tokens=args.k_tokens,  # Number of tokens to generate for reasoning
-    tokenizer=tokenizer,  # Pass tokenizer explicitly
-    rl_objective=args.train_mode,   
-    lambda_pg=0.1               
-)
-print("Trainer created")  # Debug print
+if args.train_mode == "latentreuse":
+    print("Creating trainer with MinimalCoTTrainer (latent chain-of-thought)")
+    trainer = MinimalCoTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=ds["train"],
+        eval_dataset=ds["test"],
+        data_collator=CustomDataCollator(tokenizer=tokenizer, mlm=False),
+    )
+else:
+    print("Creating trainer with KStepRolloutTrainer")
+    trainer = KStepRolloutTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=ds["train"],
+        eval_dataset=ds["test"],
+        data_collator=CustomDataCollator(tokenizer=tokenizer, mlm=False),
+        callbacks=[
+            ExactMatchCallback(test_ds, tokenizer, k_tokens=args.k_tokens, eval_steps=100)
+        ],
+        k_tokens=args.k_tokens,
+        tokenizer=tokenizer,
+        rl_objective=args.train_mode,
+        lambda_pg=0.1,
+    )
+print("Trainer created")
 
 # Start training
 trainer.train()
