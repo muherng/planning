@@ -16,6 +16,7 @@ from datetime import datetime
 from tqdm import tqdm
 import json
 import torch.nn as nn  # NEW – for hidden-state reuse wrapper
+import re  # NEW - for regex
 
 # Suppress the specific deprecation warning about Trainer.tokenizer
 warnings.filterwarnings("ignore", message="Trainer.tokenizer is now deprecated")
@@ -660,26 +661,32 @@ class HiddenStateReuseWrapper(nn.Module):
         if max_pref > 0:
             prefix_ids = input_ids[:, :max_pref]
             prefix_mask = attention_mask[:, :max_pref] if attention_mask is not None else None
-            o = self.lm(input_ids=prefix_ids,
-                        attention_mask=prefix_mask,
-                        use_cache=True,
-                        past_key_values=None,
-                        labels=None)
+            o = self.lm(
+                input_ids=prefix_ids,
+                attention_mask=prefix_mask,
+                use_cache=True,
+                past_key_values=None,
+                labels=None,
+                output_hidden_states=True,
+            )
             past = o.past_key_values
-            last_h = o.last_hidden_state[:, -1]
+            last_h = o.hidden_states[-1][:, -1]
         else:
             last_h = torch.zeros(batch_size, hidden, device=device)
 
         # 2) iterate over K latent placeholders
         for _ in range(self.k):
             emb = self.proj(last_h).unsqueeze(1)
-            o = self.lm(inputs_embeds=emb,
-                        attention_mask=None,
-                        use_cache=True,
-                        past_key_values=past,
-                        labels=None)
+            o = self.lm(
+                inputs_embeds=emb,
+                attention_mask=None,
+                use_cache=True,
+                past_key_values=past,
+                labels=None,
+                output_hidden_states=True,
+            )
             past = o.past_key_values
-            last_h = o.last_hidden_state[:, -1]
+            last_h = o.hidden_states[-1][:, -1]
 
         # 3) tail (END + answer) – supervise here
         tail_ids = input_ids[:, max_pref + self.k :]
@@ -691,8 +698,13 @@ class HiddenStateReuseWrapper(nn.Module):
             labels_tail = labels[:, max_pref + self.k :]
 
         if tail_ids.size(1):
+            # GPT-2 expects attention mask length to match total sequence (past + new)
+            # Supplying only the tail slice causes dimension mismatches, so we omit
+            # the mask here and rely on the causal mask (assumes no PAD inside
+            # prefix). If PADs do exist, one can build a full mask, but for
+            # debugging purposes this shortcut is sufficient.
             o = self.lm(input_ids=tail_ids,
-                        attention_mask=tail_mask,
+                        attention_mask=None,
                         use_cache=False,
                         past_key_values=past,
                         labels=labels_tail)
@@ -714,9 +726,12 @@ class HiddenStateReuseWrapper(nn.Module):
     def config(self):
         return self.lm.config
 
-    def save_pretrained(self, *args, **kwargs):
-        """Delegate saving to the underlying base LM."""
-        return self.lm.save_pretrained(*args, **kwargs)
+    def save_pretrained(self, save_directory, **kwargs):
+        """Delegate saving to the underlying base LM while disabling
+        safetensors to avoid shared-weight serialization issues (wte ↔︎ lm_head)."""
+
+        kwargs.setdefault("safe_serialization", False)
+        return self.lm.save_pretrained(save_directory, **kwargs)
 
 class MinimalCoTTrainer(Trainer):
     """Trainer variant used when --train_mode latentreuse is selected."""
@@ -795,6 +810,9 @@ def parse_args():
     # NEW – toggle bf16 precision (disable for small models like GPT-2)
     parser.add_argument('--bf16', action='store_true', default=False,
                       help='Enable bfloat16 mixed-precision training')
+    # DEBUG – quickly iterate by sub-sampling the dataset
+    parser.add_argument('--subset_size', type=int, default=None,
+                      help='If set, take only the first N examples from train/test for quick debugging')
     return parser.parse_args()
 
 # Parse arguments
@@ -803,9 +821,24 @@ args = parse_args()
 # Derive a short model tag (last path component without slashes)
 model_tag = os.path.basename(args.model_id)
 
+# Extract depth from data file name
+def extract_depth(data_file):
+    match = re.search(r'depth(\d+)', data_file)
+    if match:
+        return match.group(1)
+    else:
+        raise ValueError(f"Depth not found in data file name: {data_file}")
+
+# Extract depth from data file
+try:
+    depth = extract_depth(args.data_file)
+except ValueError as e:
+    print(e)
+    exit(1)
+
 # Auto-generate an output directory if the user did not specify one
 if args.output_dir is None:
-    args.output_dir = f'saved_models/depth6/{model_tag}-cfg-k{args.k_tokens}-{args.train_mode}'
+    args.output_dir = f'saved_models/depth{depth}/{model_tag}-cfg-k{args.k_tokens}-{args.train_mode}'
 
 # Add timestamp to output directory if training from checkpoint
 if args.checkpoint:
@@ -1003,6 +1036,14 @@ if not cached_dataset_loaded:
     if args.train_mode != "latentreuse" and args.save_formatted_data:
         save_formatted_dataset(ds, args.data_file, args.k_tokens)
 
+# Optional: sub-sample the dataset for quick debugging
+if args.subset_size is not None and args.subset_size > 0:
+    print(f"Sub-sampling dataset to first {args.subset_size} examples for quick debug …")
+    ds = {
+        split: subset.select(range(min(len(subset), args.subset_size)))
+        for split, subset in ds.items()
+    }
+
 # Create a separate formatted dataset for evaluation
 def format_eval_example(ex):
     return {
@@ -1028,6 +1069,7 @@ training_args = TrainingArguments(
     bf16=args.bf16,
     report_to="tensorboard",
     save_total_limit=3,
+    save_safetensors=False,  # avoid shared-memory issue in GPT2/Gemma
 )
 
 # Initialize trainer with k-token rollout
