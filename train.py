@@ -669,7 +669,7 @@ if ds is None:
     test_ds = ds["test"]
 
 # Define prompts
-SYSTEM = "You are a graph‑reasoning assistant."
+SYSTEM = "You are a reasoning assistant."
 PROMPT = "{input}\n\nLet's think step by step:\n"
 TARGET = "{label}"
 
