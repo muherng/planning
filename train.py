@@ -204,6 +204,94 @@ class ExactMatchCallback(TrainerCallback):
 
         model.train()
 
+class ExactMatchLatentCallback(TrainerCallback):
+    """Exact-match evaluation callback for the latent-reuse baseline.
+
+    Instead of generating K reasoning tokens, this variant simply inserts K
+    repeated <latent> placeholders between <begin_reasoning> and
+    <end_reasoning>. The model is then asked to generate the answer span.
+    """
+
+    def __init__(
+        self,
+        eval_dataset,
+        tokenizer,
+        k_tokens: int,
+        latent_id: int,
+        eval_steps: int = 1000,
+        max_answer_tokens: int = 2048,
+    ):
+        self.eval_ds = eval_dataset
+        self.tok = tokenizer
+        self.k = k_tokens
+        self.latent_id = latent_id
+        self.eval_steps = eval_steps
+        self.max_answer = max_answer_tokens
+
+        # constant IDs
+        self.BOS = tokenizer.bos_token_id
+        self.PAD = tokenizer.pad_token_id
+        self.EOS = tokenizer.eos_token_id
+        self.BEGIN = tokenizer.encode(
+            SPECIAL_TOKENS["begin_reasoning_token"], add_special_tokens=False
+        )[0]
+        self.END = tokenizer.encode(
+            SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False
+        )[0]
+
+    def _build_prompt(self, ex):
+        q_text = f"{SYSTEM}\n\n{PROMPT.format(**ex)}"
+        q_ids = self.tok.encode(q_text, add_special_tokens=False)
+        return torch.tensor([self.BOS] + q_ids + [self.BEGIN], dtype=torch.long)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.eval_steps != 0:
+            return
+
+        model = kwargs["model"]
+        device = next(model.parameters()).device
+        model.eval()
+
+        exact, total = 0, 0
+
+        for ex in tqdm(self.eval_ds, desc=f"[EM-latent @ {state.global_step}]"):
+            # 1) build full input with K <latent> tokens
+            prompt = self._build_prompt(ex).tolist()
+            full_ids = prompt + [self.latent_id] * self.k + [self.END]
+            full_tensor = torch.tensor(full_ids, device=device).unsqueeze(0)
+
+            # gold answer length to cap generation
+            gold_len = len(self.tok.encode(ex["label"], add_special_tokens=False))
+
+            with torch.no_grad():
+                gen = model.generate(
+                    full_tensor,
+                    max_new_tokens=gold_len,
+                    pad_token_id=self.PAD,
+                    eos_token_id=self.EOS,
+                    use_cache=True,
+                )
+
+            ans_tokens = gen[0][full_tensor.shape[1]:]
+            pred = self.tok.decode(ans_tokens, skip_special_tokens=True).strip()
+            gold = ex["label"].strip()
+
+            exact += int(pred == gold)
+            total += 1
+
+            if total <= 3:
+                print("\n── Example (latent) ──")
+                print("Q:", ex["input"])
+                print("Pred:", pred)
+                print("Gold:", gold)
+                print("Match:", pred == gold)
+
+        acc = exact / total if total else 0.0
+        print(
+            f"\n[Step {state.global_step}] latent exact-match accuracy on {total} eval examples: {acc:.4%}"
+        )
+
+        model.train()
 
 class KStepRolloutTrainer(Trainer):
     def __init__(
@@ -741,6 +829,22 @@ class MinimalCoTTrainer(Trainer):
         mask = inputs.get("attention_mask")
         labels = inputs.get("labels")
         loss = model(input_ids=ids, attention_mask=mask, labels=labels)
+
+        # Log answer cross-entropy so it aligns with other modes
+        try:
+            self.log({"answer_ce": float(loss.item())})
+        except AttributeError:
+            pass
+
+        if self.state is not None and self.state.global_step % 10 == 0:
+            print(
+                "[latentreuse] "
+                + json.dumps({
+                    "step": int(self.state.global_step),
+                    "answer_ce": float(loss.item()),
+                })
+            )
+
         return (loss, None) if return_outputs else loss
 
 # ────────────────────────────────────────────────────────────────
@@ -1081,6 +1185,9 @@ if args.train_mode == "latentreuse":
         train_dataset=ds["train"],
         eval_dataset=ds["test"],
         data_collator=CustomDataCollator(tokenizer=tokenizer, mlm=False),
+        callbacks=[
+            ExactMatchLatentCallback(test_ds, tokenizer, k_tokens=args.k_tokens, latent_id=LATENT_ID, eval_steps=100)
+        ],
     )
 else:
     print("Creating trainer with KStepRolloutTrainer")
