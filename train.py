@@ -821,6 +821,16 @@ class HiddenStateReuseWrapper(nn.Module):
         kwargs.setdefault("safe_serialization", False)
         return self.lm.save_pretrained(save_directory, **kwargs)
 
+    # -----------------------------------------------------------------
+    # Delegate generation to the underlying language model so that
+    # evaluation callbacks relying on `model.generate` work seamlessly.
+    # -----------------------------------------------------------------
+    def generate(self, *args, **kwargs):
+        """Proxy to `self.lm.generate`. Added to support callbacks like
+        ExactMatchLatentCallback that expect the model to implement
+        `generate` (present on HuggingFace `PreTrainedModel`)."""
+        return self.lm.generate(*args, **kwargs)
+
 class MinimalCoTTrainer(Trainer):
     """Trainer variant used when --train_mode latentreuse is selected."""
 

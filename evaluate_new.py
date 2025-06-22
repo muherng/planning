@@ -16,6 +16,7 @@ SPECIAL_TOKENS = {
     "pad_token": "<pad>",
     "begin_reasoning_token": "<begin_reasoning>",
     "end_reasoning_token": "<end_reasoning>",
+    "latent_token": "<latent>",  # NEW – used by latent-reuse baseline
 }
 SYSTEM = "You are a graph-reasoning assistant."
 PROMPT = "{input}\n\nLet's think step by step:\n"
@@ -69,6 +70,9 @@ def parse_args():
     p.add_argument("--checkpoint", type=str, required=True, help="Path or HF ID of the model checkpoint")
     p.add_argument("--data_file", type=str, required=True, help="JSONL dataset file (same format as train.py)")
     p.add_argument("--k_tokens", type=int, default=0, help="Number of latent reasoning tokens (K)")
+    p.add_argument("--train_mode", type=str, default="wake_sleep",
+                   choices=["wake_sleep", "reinforce", "latentreuse"],
+                   help="Training mode – needed to decide evaluation logic")
     p.add_argument("--num_examples", type=int, default=None, help="Optional cap on number of examples to evaluate")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -88,6 +92,7 @@ def main():
             "additional_special_tokens": [
                 SPECIAL_TOKENS["begin_reasoning_token"],
                 SPECIAL_TOKENS["end_reasoning_token"],
+                SPECIAL_TOKENS["latent_token"],  # ensure <latent> present
             ],
         }
     )
@@ -109,6 +114,7 @@ def main():
     # IDs of special tokens (cached)
     EOS_ID = tok.eos_token_id
     PAD_ID = tok.pad_token_id
+    LATENT_ID = tok.encode(SPECIAL_TOKENS["latent_token"], add_special_tokens=False)[0]
 
     exact, total = 0, 0
     ce_sum = 0.0
@@ -116,31 +122,38 @@ def main():
     for ex in tqdm(ds, desc="Evaluating"):
         # -------- 1) Build prompt & generate K reasoning tokens --------------
         prompt_ids = build_prompt_ids(ex, tok).to(device).unsqueeze(0)
-        reasoning = []
-        if args.k_tokens > 0:
-            with torch.no_grad():
-                gen = model.generate(
-                    prompt_ids,
-                    max_new_tokens=args.k_tokens,
-                    pad_token_id=PAD_ID,
-                    eos_token_id=EOS_ID,
-                    use_cache=True,
-                )
-            full = gen[0]
-            reasoning_tokens = full[prompt_ids.shape[1]:]
-            # strip EOS and pad to k
-            eos_positions = (reasoning_tokens == EOS_ID).nonzero(as_tuple=True)[0]
-            if eos_positions.numel() > 0:
-                reasoning_tokens = reasoning_tokens[: eos_positions[-1]]
-            if reasoning_tokens.numel() < args.k_tokens:
-                pad_len = args.k_tokens - reasoning_tokens.numel()
-                reasoning_tokens = torch.cat([
-                    reasoning_tokens,
-                    torch.full((pad_len,), PAD_ID, dtype=torch.long, device=device),
-                ])
-            reasoning = reasoning_tokens.tolist()
+
+        # ------------------------------------------------------------
+        # Obtain reasoning tokens depending on training mode
+        # ------------------------------------------------------------
+        if args.train_mode == "latentreuse":
+            # Insert fixed <latent> placeholders (no generation step)
+            reasoning = [LATENT_ID] * args.k_tokens if args.k_tokens > 0 else []
         else:
+            # wake_sleep / reinforce: generate reasoning tokens if K>0
             reasoning = []
+            if args.k_tokens > 0:
+                with torch.no_grad():
+                    gen = model.generate(
+                        prompt_ids,
+                        max_new_tokens=args.k_tokens,
+                        pad_token_id=PAD_ID,
+                        eos_token_id=EOS_ID,
+                        use_cache=True,
+                    )
+                full = gen[0]
+                reasoning_tokens = full[prompt_ids.shape[1]:]
+                # strip EOS and pad to k
+                eos_positions = (reasoning_tokens == EOS_ID).nonzero(as_tuple=True)[0]
+                if eos_positions.numel() > 0:
+                    reasoning_tokens = reasoning_tokens[: eos_positions[-1]]
+                if reasoning_tokens.numel() < args.k_tokens:
+                    pad_len = args.k_tokens - reasoning_tokens.numel()
+                    reasoning_tokens = torch.cat([
+                        reasoning_tokens,
+                        torch.full((pad_len,), PAD_ID, dtype=torch.long, device=device),
+                    ])
+                reasoning = reasoning_tokens.tolist()
 
         # -------- 2) Build second input (prompt + reasoning + <end>) ----------
         END_ID = tok.encode(SPECIAL_TOKENS["end_reasoning_token"], add_special_tokens=False)[0]
