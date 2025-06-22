@@ -65,16 +65,33 @@ class GPTDiag(GPTNeoForCausalLM):
         diag_slice : (B,2) tensor with [d0,d1] (absolute indices *in the batch row*)
         """
         if diag_slice is not None:
+            # Build a **4-D** additive attention mask expected by GPT-Neo:
+            #   (batch, 1, tgt_len, src_len)
+            #   0.0  → attend;   -inf → block
+
             B, L = input_ids.shape
-            attn = torch.tril(torch.ones(B, L, L, device=input_ids.device))
+
+            # ── base causal mask: lower-triangular (allow past tokens) ──
+            causal_bool = torch.tril(torch.ones(L, L, dtype=torch.bool, device=input_ids.device))
+
+            # prepare per-batch boolean mask we will tweak
+            mask_bool = causal_bool.unsqueeze(0).expand(B, L, L).clone()
+
+            # ── unblock the chosen CKY diagonal slice for each sample ──
+            #    (make it fully bidirectional within the slice)
             for b in range(B):
-                d0, d1 = diag_slice[b]
-                attn[b, d0:d1, d0:d1] = 1        # unblock current diagonal
-            kw["attention_mask"] = torch.where(
-                attn.bool(),
-                torch.zeros_like(attn, dtype=torch.float),
-                torch.full_like(attn, float("-inf"), dtype=torch.float),
+                d0, d1 = diag_slice[b].tolist()
+                mask_bool[b, d0:d1, d0:d1] = True
+
+            # convert to additive fp32 mask
+            attn_mask = torch.where(
+                mask_bool,
+                torch.zeros_like(mask_bool, dtype=torch.float32),
+                torch.full_like(mask_bool, float("-inf"), dtype=torch.float32),
             )
+
+            # GPT-Neo expects (B,1,L,L)
+            kw["attention_mask"] = attn_mask.unsqueeze(1)
         return super().forward(input_ids=input_ids, **kw)
 
 
