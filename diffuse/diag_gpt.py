@@ -102,11 +102,15 @@ class SliceEval(TrainerCallback):
                     example_loss, example_tok = 0.0, 0
                     for d0, d1 in slices:
                         off0, off1 = len(q_ids) + d0, len(q_ids) + d1
+                        # ── align with training loss: logits at position t predict token t+1 ──
+                        shift0, shift1 = off0 - 1, off1 - 1
                         with torch.no_grad():
-                            logits = model(
+                            full_logits = model(
                                 input_ids=torch.tensor([seq], device=device),
                                 diag_slice=torch.tensor([[off0, off1]], device=device),
-                            ).logits[0, off0:off1]
+                            ).logits[0]
+
+                        logits = full_logits[shift0:shift1]
 
                         gold = torch.tensor(tr_ids[d0:d1], device=device)
                         loss = F.cross_entropy(logits, gold, reduction="sum")
@@ -128,6 +132,8 @@ class SliceEval(TrainerCallback):
                     idx = min(self.slice_index, len(slices) - 1)
                     d0, d1 = slices[idx]
                     off0, off1 = len(q_ids) + d0, len(q_ids) + d1
+                    # ── align with training loss: logits at position t predict token t+1 ──
+                    shift0, shift1 = off0 - 1, off1 - 1
 
                     # Build sequence with only this slice noised out
                     seq = q_ids + tr_ids
@@ -135,10 +141,12 @@ class SliceEval(TrainerCallback):
                         seq[len(q_ids) + i] = self.noise_id
 
                     with torch.no_grad():
-                        logits = model(
+                        full_logits = model(
                             input_ids=torch.tensor([seq], device=device),
                             diag_slice=torch.tensor([[off0, off1]], device=device),
-                        ).logits[0, off0:off1]
+                        ).logits[0]
+
+                    logits = full_logits[shift0:shift1]
 
                     gold = torch.tensor(tr_ids[d0:d1], device=device)
                     loss = F.cross_entropy(logits, gold, reduction="sum")
@@ -449,7 +457,7 @@ def main():
         eval_steps=20,
     )
 
-    train_mon = TrainMonitor(train_dset, tok, print_every=500, n_examples=2)
+    train_mon = TrainMonitor(train_dset, tok, print_every=10, n_examples=2)
 
     # ── model ────────────────────────────────────────────────────────
     model_name_or_path = args.resume if args.resume else args.model
@@ -466,7 +474,7 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         save_strategy="steps",
         save_steps=5000,
-        logging_steps=100,
+        logging_steps=10,
         remove_unused_columns=False,
     )
 
@@ -512,12 +520,14 @@ class TrainMonitor(TrainerCallback):
             inp = ex["input_ids"].unsqueeze(0).to(device)
             slc = ex["diag_slice"].unsqueeze(0).to(device)
             with torch.no_grad():
-                logits = model(input_ids=inp, diag_slice=slc).logits[0]
+                full_logits = model(input_ids=inp, diag_slice=slc).logits[0]
 
             d0, d1 = ex["diag_slice"].tolist()
             gold_ids = ex["labels"][d0:d1].to(device)
-            pred_ids = logits.argmax(-1)[d0:d1]
-            losses   = F.cross_entropy(logits[d0:d1], gold_ids, reduction="none")
+            # shift for causal alignment
+            shift0, shift1 = d0 - 1, d1 - 1
+            pred_ids = full_logits.argmax(-1)[shift0:shift1]
+            losses   = F.cross_entropy(full_logits[shift0:shift1], gold_ids, reduction="none")
 
             gold_toks = self.tok.convert_ids_to_tokens(gold_ids.tolist())
             pred_toks = self.tok.convert_ids_to_tokens(pred_ids.tolist())
