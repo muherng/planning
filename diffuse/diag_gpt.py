@@ -36,6 +36,106 @@ from transformers import (
     TrainingArguments,
 )
 
+# ────────────────────────────────────────────────────────────────────
+# 7  Evaluation callback: slice-by-slice decoding metrics
+# ────────────────────────────────────────────────────────────────────
+import torch.nn.functional as F
+from transformers import TrainerCallback
+import numpy as np
+import textwrap, random
+
+class SliceEval(TrainerCallback):
+    """
+    • Runs every `eval_steps`.
+    • For each of N examples:
+        – iteratively decodes all diagonals starting from <NOISE>
+        – accumulates cross-entropy on each decoded slice
+        – counts 0-1 accuracy on the reasoning tokens
+    • Prints aggregated CE/token, exact-match %, and 3 random decodes.
+    """
+    def __init__(self,
+                 eval_hfds, tok,
+                 noise_id, delim_id,
+                 max_examples=100,
+                 eval_steps=100,
+                 print_examples=3):
+        self.eval_set = eval_hfds
+        self.tok      = tok
+        self.noise_id = noise_id
+        self.delim_id = delim_id
+        self.max_examples  = max_examples
+        self.eval_steps    = eval_steps
+        self.print_examples= print_examples
+
+    # --------------------------------------------------------------
+    def on_step_end(self, args, state, control, **kw):
+        print(f"on_step_end: {state.global_step}")
+        if state.global_step % self.eval_steps == 0:         # only every k steps
+            model  = kw["model"].eval()
+            device = next(model.parameters()).device
+
+            tot_loss, tot_tok, tot_exact = 0.0, 0, 0
+            samples_to_print = []
+
+            for ex_id in range(min(self.max_examples, len(self.eval_set))):
+                ex = self.eval_set[ex_id]                  # raw HF row
+
+                # ---------- tokenise once ----------
+                q_ids  = self.tok(ex["question"],
+                                add_special_tokens=False).input_ids
+                tr_ids = self.tok(ex["reasoning"],
+                                add_special_tokens=False).input_ids
+                slices = diag_slices_from_delim(tr_ids, self.delim_id)
+
+                seq   = q_ids + [self.noise_id if tid!=self.delim_id else tid
+                                for tid in tr_ids]
+
+                # ---------- iterative decode ----------
+                example_loss, example_tok = 0.0, 0
+                for d0, d1 in slices:
+                    off0, off1 = len(q_ids)+d0, len(q_ids)+d1
+
+                    with torch.no_grad():
+                        logits = model(
+                            input_ids=torch.tensor([seq], device=device),
+                            diag_slice=torch.tensor([[off0, off1]], device=device)
+                        ).logits[0, off0:off1]
+
+                    # CE on this slice
+                    gold = torch.tensor(tr_ids[d0:d1], device=device)
+                    loss = F.cross_entropy(logits, gold, reduction="sum")
+                    example_loss += loss.item()
+                    example_tok  += (off1-off0)
+
+                    # greedy update of sequence
+                    seq[off0:off1] = logits.argmax(-1).tolist()
+
+                # ---------- bookkeeping ----------
+                tot_loss += example_loss
+                tot_tok  += example_tok
+                pred_reasoning = self.tok.decode(
+                    seq[len(q_ids):], skip_special_tokens=False).strip()
+                tot_exact += int(pred_reasoning == ex["reasoning"])
+
+                if len(samples_to_print) < self.print_examples:
+                    samples_to_print.append((ex["question"],
+                                            ex["reasoning"],
+                                            pred_reasoning))
+
+            # ---------- print metrics ----------
+            ce_per_tok = tot_loss / tot_tok
+            exact_pct  = tot_exact / min(self.max_examples, len(self.eval_set)) * 100
+            print(f"\n[EVAL step {state.global_step}] "
+                f"cross-entropy/token={ce_per_tok:.4f} | "
+                f"trace exact-match={exact_pct:.1f}%")
+
+            for q,gold,pred in samples_to_print:
+                print("\nQ:", q)
+                print("Gold reasoning:\n", textwrap.fill(gold, 120))
+                print("Pred reasoning:\n", textwrap.fill(pred, 120))
+                print("-"*80)
+        return 
+
 # ──────────────────────────────────────────────────────────────────────
 # 1  Special tokens
 # ──────────────────────────────────────────────────────────────────────
@@ -189,9 +289,16 @@ def main():
     pad_id  = tok.pad_token_id or tok.eos_token_id
     noise_id= tok.convert_tokens_to_ids(NOISE_TOKEN)
 
-    # ── dataset ──────────────────────────────────────────────────────
-    raw = load_dataset("json", data_files=args.data)["train"]
-    dset = TraceDataset(raw, tok)
+    # after building `tok`, `pad_id`, `noise_id` ...
+    raw_train = load_dataset("json", data_files=args.data)["train"]
+    train_dset = TraceDataset(raw_train, tok)
+
+    raw_eval  = load_dataset("json", data_files=args.data)["train"].select(range(100))
+    # or load a separate dev file
+    eval_cb   = SliceEval(raw_eval, tok,
+                        noise_id, tok.convert_tokens_to_ids(DIAG_END_TOK),
+                        max_examples=100,
+                        eval_steps=100)
 
     # ── model ────────────────────────────────────────────────────────
     model = GPTDiag.from_pretrained(args.model)
@@ -213,8 +320,9 @@ def main():
     trainer = Trainer(
         model=model,
         args=targs,
-        train_dataset=dset,
+        train_dataset=train_dset,
         data_collator=lambda b: collate(b, pad_id=pad_id),
+        callbacks=[eval_cb]
     )
     trainer.train()
     trainer.save_model()
