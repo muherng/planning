@@ -67,9 +67,12 @@ class SliceEval(TrainerCallback):
         self.eval_steps    = eval_steps
         self.print_examples= print_examples
 
+        # how often to show running train CE/token from Trainer logs
+        self.loss_every = 10
+
     # --------------------------------------------------------------
     def on_step_end(self, args, state, control, **kw):
-        print(f"on_step_end: {state.global_step}")
+        #print(f"on_step_end: {state.global_step}")
         if state.global_step % self.eval_steps == 0:         # only every k steps
             model  = kw["model"].eval()
             device = next(model.parameters()).device
@@ -134,7 +137,17 @@ class SliceEval(TrainerCallback):
                 print("Gold reasoning:\n", textwrap.fill(gold, 120))
                 print("Pred reasoning:\n", textwrap.fill(pred, 120))
                 print("-"*80)
-        return 
+
+    # --------------------------------------------------------------
+    # Short, frequent loss print from Trainer's logging events
+    # --------------------------------------------------------------
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Print average cross-entropy per token every ``self.loss_every`` steps."""
+        if logs is None or "loss" not in logs:
+            return
+        if state.global_step % self.loss_every == 0:
+            ce = logs["loss"]  # already average per token because labels use -100 mask
+            print(f"[step {state.global_step}] train CE/token = {ce:.4f}")
 
 # ──────────────────────────────────────────────────────────────────────
 # 1  Special tokens
@@ -201,11 +214,16 @@ class GPTDiag(GPTNeoForCausalLM):
 class TraceDataset(Dataset):
     """On-the-fly diagonal corruption."""
 
-    def __init__(self, hf_ds, tok):
+    def __init__(self, hf_ds, tok, slice_index: int = -1):
+        """If ``slice_index`` >= 0, the *same* diagonal (0-based) will be masked
+        on every sample.  Useful for debugging or curriculum learning.  A value
+        of -1 keeps the original random-slice behaviour."""
+
         self.ds   = hf_ds
         self.tok  = tok
-        self.noise_id = tok.convert_tokens_to_ids(NOISE_TOKEN)
-        self.delim_id = tok.convert_tokens_to_ids(DIAG_END_TOK)
+        self.noise_id   = tok.convert_tokens_to_ids(NOISE_TOKEN)
+        self.delim_id   = tok.convert_tokens_to_ids(DIAG_END_TOK)
+        self.slice_index= slice_index
 
     def __len__(self): return len(self.ds)
 
@@ -214,8 +232,12 @@ class TraceDataset(Dataset):
         q_ids   = self.tok(ex["question"], add_special_tokens=False).input_ids
         trace   = self.tok(ex["reasoning"], add_special_tokens=False).input_ids
 
-        slices  = diag_slices_from_delim(trace, self.delim_id)
-        d0, d1  = random.choice(slices)                 # choose a diagonal
+        slices = diag_slices_from_delim(trace, self.delim_id)
+        if self.slice_index is None or self.slice_index < 0:
+            d0, d1 = random.choice(slices)
+        else:
+            idx = min(self.slice_index, len(slices) - 1)
+            d0, d1 = slices[idx]
 
         # build input & labels
         inp   = q_ids + trace
@@ -230,36 +252,67 @@ class TraceDataset(Dataset):
         return {
             "input_ids" : torch.tensor(inp, dtype=torch.long),
             "labels"    : torch.tensor(labs, dtype=torch.long),
-            "diag_slice": torch.tensor((q_len + d0, q_len + d1), dtype=torch.long)
+            "diag_slice": torch.tensor((q_len + d0, q_len + d1), dtype=torch.long),
+            "question"  : ex["question"],
+            "reasoning" : ex["reasoning"],
         }
 
 # ──────────────────────────────────────────────────────────────────────
 # 5  Collator
 # ──────────────────────────────────────────────────────────────────────
-def collate(batch, pad_id: int):
-    maxlen = max(len(x["input_ids"]) for x in batch)
-    B      = len(batch)
+def collate(batch, pad_id: int, tok, slice_index: int = -1):
+    # -----------------------------------------------------------------
+    #print("\n=== DEBUG: incoming batch snapshot ===")
+    #for i, item in enumerate(batch):
+    #    print(f"[{i}] type={type(item)} keys={list(item.keys()) if isinstance(item, dict) else 'N/A'}")
+    #print("=== END DEBUG ===\n")
+    # -----------------------------------------------------------------
 
+    maxlen = 0
+    processed = []
+
+    delim_id = tok.convert_tokens_to_ids(DIAG_END_TOK)
+    noise_id = tok.convert_tokens_to_ids(NOISE_TOKEN)
+
+    for ex in batch:
+        if "labels" in ex and "diag_slice" in ex:
+            processed.append(ex)
+            maxlen = max(maxlen, len(ex["input_ids"]))
+        else:
+            # Fallback: raw JSON example – build corruption here
+            q_ids = tok(ex["question"], add_special_tokens=False).input_ids
+            trace = tok(ex["reasoning"], add_special_tokens=False).input_ids
+            slices = diag_slices_from_delim(trace, delim_id)
+            if slice_index is None or slice_index < 0:
+                d0, d1 = random.choice(slices)
+            else:
+                idx = min(slice_index, len(slices) - 1)
+                d0, d1 = slices[idx]
+            inp   = q_ids + trace
+            labs  = [-100] * len(inp)
+            q_len = len(q_ids)
+            for i in range(d0, d1):
+                labs[q_len + i] = trace[i]
+                inp [q_len + i] = noise_id
+            processed.append({
+                "input_ids": torch.tensor(inp,  dtype=torch.long),
+                "labels"   : torch.tensor(labs, dtype=torch.long),
+                "diag_slice": torch.tensor((q_len + d0, q_len + d1), dtype=torch.long),
+                "question" : ex["question"],
+                "reasoning": ex["reasoning"],
+            })
+            maxlen = max(maxlen, len(inp))
+
+    B = len(processed)
     inp  = torch.full((B, maxlen), pad_id, dtype=torch.long)
     lab  = torch.full((B, maxlen), -100, dtype=torch.long)
     slc  = torch.zeros((B, 2),     dtype=torch.long)
 
-    for b, ex in enumerate(batch):
+    for b, ex in enumerate(processed):
         L = len(ex["input_ids"])
         inp[b, :L] = ex["input_ids"]
-
-        # Some buggy upstream datapoints in older JSONL files may miss the
-        # pre-computed "labels" tensor.  Re-derive it on the fly so training
-        # can proceed rather than crashing.
-        if "labels" in ex:
-            lab[b, :L] = ex["labels"]
-        else:
-            # everything is ignore index except the diagonal slice
-            lab[b, :] = -100
-            d0, d1 = ex["diag_slice"]
-            lab[b, d0:d1] = inp[b, d0:d1]
-
-        slc[b] = ex["diag_slice"]
+        lab[b, :L] = ex["labels"]
+        slc[b]     = ex["diag_slice"]
 
     return {"input_ids": inp, "labels": lab, "diag_slice": slc}
 
@@ -277,6 +330,8 @@ def train_cli():
     ap.add_argument("--lr",    type=float, default=2e-5)
     ap.add_argument("--fp16",  action="store_true")
     ap.add_argument("--grad_accum", type=int, default=4)
+    ap.add_argument("--slice_index", type=int, default=-1,
+                    help="If >=0, always corrupt this diagonal slice (0=first). -1=random slice (default)")
     return ap.parse_args()
 
 
@@ -291,7 +346,7 @@ def main():
 
     # after building `tok`, `pad_id`, `noise_id` ...
     raw_train = load_dataset("json", data_files=args.data)["train"]
-    train_dset = TraceDataset(raw_train, tok)
+    train_dset = TraceDataset(raw_train, tok, slice_index=args.slice_index)
 
     raw_eval  = load_dataset("json", data_files=args.data)["train"].select(range(100))
     # or load a separate dev file
@@ -315,13 +370,14 @@ def main():
         save_strategy="steps",
         save_steps=5000,
         logging_steps=100,
+        remove_unused_columns=False,
     )
 
     trainer = Trainer(
         model=model,
         args=targs,
         train_dataset=train_dset,
-        data_collator=lambda b: collate(b, pad_id=pad_id),
+        data_collator=lambda b: collate(b, pad_id=pad_id, tok=tok, slice_index=args.slice_index),
         callbacks=[eval_cb]
     )
     trainer.train()

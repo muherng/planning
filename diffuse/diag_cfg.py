@@ -12,7 +12,7 @@ Produces JSON-L lines of the form
 
 The <diag_end> sentinel appears **after every diagonal** of the flattened
 DP table except the last one.  Your training script can therefore treat all
-tokens between successive <diag_end>s as the “parallel chunk” to predict in
+tokens between successive <diag_end>s as the "parallel chunk" to predict in
 one forward pass.
 """
 
@@ -208,29 +208,61 @@ def cli():
     p=argparse.ArgumentParser()
     p.add_argument("--grammar",required=True,type=Path)
     p.add_argument("--out",default="data",type=Path)
-    p.add_argument("--train",type=int,default=100_000)
-    p.add_argument("--test", type=int,default=2_000)
-    p.add_argument("--max_tokens",type=int,default=30)
-    p.add_argument("--max_depth", type=int,default=40)
+    p.add_argument("--train",type=int,default=100)
+    p.add_argument("--test", type=int,default=100)
+    p.add_argument("--max_tokens",type=int,default=40)
+    p.add_argument("--max_depth", type=int,default=10)
     p.add_argument("--recursion_prob",type=float,default=None)
     p.add_argument("--seed",type=int,default=42)
     return p.parse_args()
 
-def write_split(n, path, grammar, args):
+def write_split(n, path, grammar, grammar_text, args):
     with path.open("w") as fh:
         for _ in range(n):
-            ex = make_example(grammar,
-                              max_depth=args.max_depth,
-                              max_tokens=args.max_tokens,
-                              rec_prob=args.recursion_prob)
-            json.dump(ex, fh); fh.write("\n")
+            ex = make_example(
+                grammar,
+                max_depth=args.max_depth,
+                max_tokens=args.max_tokens,
+                rec_prob=args.recursion_prob,
+            )
+            # Prepend the raw grammar text (exactly as written in the CNF file)
+            # to the beginning of the question field, separated by a newline so
+            # that downstream tokenisation can still detect sentence/grammar
+            # boundaries.  We strip a single trailing newline from the grammar
+            # text to avoid adding an empty line before the question tokens.
+            ex["question"] = grammar_text.rstrip("\n") + "\n" + ex["question"]
+            json.dump(ex, fh)
+            fh.write("\n")
 
 def main():
-    args=cli(); random.seed(args.seed)
-    grammar=Grammar.from_file(args.grammar)
+    args = cli()
+    random.seed(args.seed)
+
+    # Load grammar both as a parsed object and as raw text.  The parsed object
+    # is used for sampling derivations, while the raw text is prepended to each
+    # generated question so the model can see the full grammar.
+    grammar = Grammar.from_file(args.grammar)
+    grammar_text = args.grammar.read_text()
+
     args.out.mkdir(parents=True, exist_ok=True)
-    write_split(args.train, args.out/f"train_{args.train}_{args.max_tokens}_{args.max_depth}_{args.recursion_prob}.jsonl", grammar, args)
-    write_split(args.test,  args.out/f"test_{args.test}_{args.max_tokens}_{args.max_depth}_{args.recursion_prob}.jsonl",  grammar, args)
+
+    write_split(
+        args.train,
+        args.out
+        / f"train_{args.train}_{args.max_tokens}_{args.max_depth}_{args.recursion_prob}.jsonl",
+        grammar,
+        grammar_text,
+        args,
+    )
+    write_split(
+        args.test,
+        args.out
+        / f"test_{args.test}_{args.max_tokens}_{args.max_depth}_{args.recursion_prob}.jsonl",
+        grammar,
+        grammar_text,
+        args,
+    )
+
     print("Done.  Files at", args.out, f"(delimiter token: {DIAG_END})")
 
 if __name__=="__main__":
