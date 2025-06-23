@@ -23,7 +23,7 @@ Example:
 }
 """
 
-import json, random, math, argparse, pathlib
+import json, random, math, argparse, pathlib, datetime
 from typing import List, Tuple, Dict, Any
 
 import torch
@@ -56,13 +56,17 @@ class SliceEval(TrainerCallback):
     def __init__(self,
                  eval_hfds, tok,
                  noise_id, delim_id,
+                 slice_index: int = -1,
                  max_examples=100,
                  eval_steps=100,
                  print_examples=3):
+        """If ``slice_index`` >= 0, only that diagonal is evaluated and printed.
+        Otherwise the original iterative evaluation is used."""
         self.eval_set = eval_hfds
         self.tok      = tok
         self.noise_id = noise_id
         self.delim_id = delim_id
+        self.slice_index = slice_index
         self.max_examples  = max_examples
         self.eval_steps    = eval_steps
         self.print_examples= print_examples
@@ -84,59 +88,102 @@ class SliceEval(TrainerCallback):
                 ex = self.eval_set[ex_id]                  # raw HF row
 
                 # ---------- tokenise once ----------
-                q_ids  = self.tok(ex["question"],
-                                add_special_tokens=False).input_ids
-                tr_ids = self.tok(ex["reasoning"],
-                                add_special_tokens=False).input_ids
+                q_ids  = self.tok(ex["question"], add_special_tokens=False).input_ids
+                tr_ids = self.tok(ex["reasoning"], add_special_tokens=False).input_ids
                 slices = diag_slices_from_delim(tr_ids, self.delim_id)
 
-                seq   = q_ids + [self.noise_id if tid!=self.delim_id else tid
-                                for tid in tr_ids]
+                if self.slice_index is None or self.slice_index < 0:
+                    # ------- original iterative evaluation over all diagonals -------
+                    seq = q_ids + [self.noise_id if tid != self.delim_id else tid for tid in tr_ids]
+                    example_loss, example_tok = 0.0, 0
+                    for d0, d1 in slices:
+                        off0, off1 = len(q_ids) + d0, len(q_ids) + d1
+                        with torch.no_grad():
+                            logits = model(
+                                input_ids=torch.tensor([seq], device=device),
+                                diag_slice=torch.tensor([[off0, off1]], device=device),
+                            ).logits[0, off0:off1]
 
-                # ---------- iterative decode ----------
-                example_loss, example_tok = 0.0, 0
-                for d0, d1 in slices:
-                    off0, off1 = len(q_ids)+d0, len(q_ids)+d1
+                        gold = torch.tensor(tr_ids[d0:d1], device=device)
+                        loss = F.cross_entropy(logits, gold, reduction="sum")
+                        example_loss += loss.item()
+                        example_tok += off1 - off0
+
+                        seq[off0:off1] = logits.argmax(-1).tolist()
+
+                    pred_reasoning = self.tok.decode(
+                        seq[len(q_ids):], skip_special_tokens=False
+                    ).strip()
+                    tot_exact += int(pred_reasoning == ex["reasoning"])
+
+                    if len(samples_to_print) < self.print_examples:
+                        samples_to_print.append((ex["question"], ex["reasoning"], pred_reasoning))
+
+                else:
+                    # ------- fixed slice evaluation (debugging) -------
+                    idx = min(self.slice_index, len(slices) - 1)
+                    d0, d1 = slices[idx]
+                    off0, off1 = len(q_ids) + d0, len(q_ids) + d1
+
+                    # Build sequence with only this slice noised out
+                    seq = q_ids + tr_ids
+                    for i in range(d0, d1):
+                        seq[len(q_ids) + i] = self.noise_id
 
                     with torch.no_grad():
                         logits = model(
                             input_ids=torch.tensor([seq], device=device),
-                            diag_slice=torch.tensor([[off0, off1]], device=device)
+                            diag_slice=torch.tensor([[off0, off1]], device=device),
                         ).logits[0, off0:off1]
 
-                    # CE on this slice
                     gold = torch.tensor(tr_ids[d0:d1], device=device)
                     loss = F.cross_entropy(logits, gold, reduction="sum")
-                    example_loss += loss.item()
-                    example_tok  += (off1-off0)
+                    example_loss = loss.item()
+                    example_tok = off1 - off0
 
-                    # greedy update of sequence
                     seq[off0:off1] = logits.argmax(-1).tolist()
 
-                # ---------- bookkeeping ----------
-                tot_loss += example_loss
-                tot_tok  += example_tok
-                pred_reasoning = self.tok.decode(
-                    seq[len(q_ids):], skip_special_tokens=False).strip()
-                tot_exact += int(pred_reasoning == ex["reasoning"])
+                    pred_slice = self.tok.decode(seq[off0:off1], skip_special_tokens=False).strip()
+                    gold_slice = self.tok.decode(tr_ids[d0:d1], skip_special_tokens=False).strip()
 
-                if len(samples_to_print) < self.print_examples:
-                    samples_to_print.append((ex["question"],
-                                            ex["reasoning"],
-                                            pred_reasoning))
+                    if len(samples_to_print) < self.print_examples:
+                        samples_to_print.append((ex["question"], gold_slice, pred_slice))
+
+                    # For exact-match under fixed-slice mode, compare slice only
+                    tot_exact += int(pred_slice == gold_slice)
+
+                    pred_reasoning = None  # not used under fixed-slice mode
+
+                    tot_loss += example_loss
+                    tot_tok += example_tok
 
             # ---------- print metrics ----------
             ce_per_tok = tot_loss / tot_tok
-            exact_pct  = tot_exact / min(self.max_examples, len(self.eval_set)) * 100
-            print(f"\n[EVAL step {state.global_step}] "
-                f"cross-entropy/token={ce_per_tok:.4f} | "
-                f"trace exact-match={exact_pct:.1f}%")
-
-            for q,gold,pred in samples_to_print:
-                print("\nQ:", q)
-                print("Gold reasoning:\n", textwrap.fill(gold, 120))
-                print("Pred reasoning:\n", textwrap.fill(pred, 120))
-                print("-"*80)
+            exact_pct = (
+                tot_exact / min(self.max_examples, len(self.eval_set)) * 100
+            )
+            if self.slice_index is None or self.slice_index < 0:
+                print(
+                    f"\n[EVAL step {state.global_step}] "
+                    f"cross-entropy/token={ce_per_tok:.4f} | "
+                    f"trace exact-match={exact_pct:.1f}%"
+                )
+                for q, gold, pred in samples_to_print:
+                    print("\nQ:", q)
+                    print("Gold reasoning:\n", textwrap.fill(gold, 120))
+                    print("Pred reasoning:\n", textwrap.fill(pred, 120))
+                    print("-" * 80)
+            else:
+                print(
+                    f"\n[EVAL step {state.global_step}] "
+                    f"cross-entropy/token={ce_per_tok:.4f} | "
+                    f"slice-{self.slice_index} exact-match={exact_pct:.1f}%"
+                )
+                for q, gold_slice, pred_slice in samples_to_print:
+                    print("\nQ:", q)
+                    print("Gold slice:", gold_slice)
+                    print("Pred slice:", pred_slice)
+                    print("-" * 80)
 
     # --------------------------------------------------------------
     # Short, frequent loss print from Trainer's logging events
@@ -324,12 +371,14 @@ def train_cli():
     ap = argparse.ArgumentParser("Diagonal denoising GPT – train")
     ap.add_argument("--model", required=True, help="e.g. EleutherAI/gpt-neo-125M")
     ap.add_argument("--data",  required=True, help="train.jsonl path")
-    ap.add_argument("--out",   required=True, help="output dir")
+    ap.add_argument("--out",   required=True, help="output dir", default="diag_gpt")
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--epochs",type=int, default=3)
     ap.add_argument("--lr",    type=float, default=2e-5)
     ap.add_argument("--fp16",  action="store_true")
     ap.add_argument("--grad_accum", type=int, default=4)
+    ap.add_argument("--resume", type=str, default=None,
+                    help="Path to a saved checkpoint directory to resume training from. If provided, training will continue from that checkpoint and output will be written back to the same run directory.")
     ap.add_argument("--slice_index", type=int, default=-1,
                     help="If >=0, always corrupt this diagonal slice (0=first). -1=random slice (default)")
     return ap.parse_args()
@@ -337,6 +386,19 @@ def train_cli():
 
 def main():
     args = train_cli()
+    # Determine output directory.  If the user is resuming from a checkpoint
+    # keep writing into the SAME run directory so all artefacts live together.
+    # A resume path may point either to the run root or to a specific
+    # "checkpoint-*" sub-folder.
+    if args.resume:
+        resume_path = pathlib.Path(args.resume)
+        if resume_path.name.startswith("checkpoint-"):
+            args.out = str(resume_path.parent)
+        else:
+            args.out = str(resume_path)
+    else:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.out = f"{args.out}_{timestamp}"
 
     # ── tokenizer & special tokens ───────────────────────────────────
     tok = AutoTokenizer.from_pretrained(args.model)
@@ -350,10 +412,15 @@ def main():
 
     raw_eval  = load_dataset("json", data_files=args.data)["train"].select(range(100))
     # or load a separate dev file
-    eval_cb   = SliceEval(raw_eval, tok,
-                        noise_id, tok.convert_tokens_to_ids(DIAG_END_TOK),
-                        max_examples=100,
-                        eval_steps=100)
+    eval_cb = SliceEval(
+        raw_eval,
+        tok,
+        noise_id,
+        tok.convert_tokens_to_ids(DIAG_END_TOK),
+        slice_index=args.slice_index,
+        max_examples=100,
+        eval_steps=100,
+    )
 
     # ── model ────────────────────────────────────────────────────────
     model = GPTDiag.from_pretrained(args.model)
@@ -380,7 +447,7 @@ def main():
         data_collator=lambda b: collate(b, pad_id=pad_id, tok=tok, slice_index=args.slice_index),
         callbacks=[eval_cb]
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume)
     trainer.save_model()
 
 if __name__ == "__main__":
