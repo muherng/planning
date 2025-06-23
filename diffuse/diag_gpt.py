@@ -70,6 +70,9 @@ class SliceEval(TrainerCallback):
         self.max_examples  = max_examples
         self.eval_steps    = eval_steps
         self.print_examples= print_examples
+        # accumulate per-token accuracy (fixed-slice mode)
+        self._tot_correct = 0
+        self._tot_tokens  = 0
 
         # how often to show running train CE/token from Trainer logs
         self.loss_every = 10
@@ -82,6 +85,7 @@ class SliceEval(TrainerCallback):
             device = next(model.parameters()).device
 
             tot_loss, tot_tok, tot_exact = 0.0, 0, 0
+            tot_tok_correct = 0  # token-level accuracy numerator
             samples_to_print = []
 
             for ex_id in range(min(self.max_examples, len(self.eval_set))):
@@ -143,11 +147,27 @@ class SliceEval(TrainerCallback):
 
                     seq[off0:off1] = logits.argmax(-1).tolist()
 
-                    pred_slice = self.tok.decode(seq[off0:off1], skip_special_tokens=False).strip()
-                    gold_slice = self.tok.decode(tr_ids[d0:d1], skip_special_tokens=False).strip()
+                    # token-level accuracy for this slice
+                    pred_ids = logits.argmax(-1)
+                    tok_correct = (pred_ids == gold).sum().item()
+                    tot_tok_correct += tok_correct
+
+                    # keep raw tokens for printing
+                    pred_slice_ids = pred_ids.tolist()
+                    gold_slice_ids = gold.tolist()
+                    pred_slice_tokens = self.tok.convert_ids_to_tokens(pred_slice_ids)
+                    gold_slice_tokens = self.tok.convert_ids_to_tokens(gold_slice_ids)
+
+                    matches = [p == g for p, g in zip(pred_slice_ids, gold_slice_ids)]
+
+                    pred_slice = " ".join(pred_slice_tokens)
+                    gold_slice = " ".join(gold_slice_tokens)
+
+                    token_losses_tensor = F.cross_entropy(logits, gold, reduction='none')
+                    token_losses_list = [f"{v:.3f}" for v in token_losses_tensor.tolist()]
 
                     if len(samples_to_print) < self.print_examples:
-                        samples_to_print.append((ex["question"], gold_slice, pred_slice))
+                        samples_to_print.append((ex["question"], gold_slice_tokens, pred_slice_tokens, matches, token_losses_list))
 
                     # For exact-match under fixed-slice mode, compare slice only
                     tot_exact += int(pred_slice == gold_slice)
@@ -177,12 +197,19 @@ class SliceEval(TrainerCallback):
                 print(
                     f"\n[EVAL step {state.global_step}] "
                     f"cross-entropy/token={ce_per_tok:.4f} | "
-                    f"slice-{self.slice_index} exact-match={exact_pct:.1f}%"
+                    f"slice-{self.slice_index} exact-match={exact_pct:.1f}% | "
+                    f"token-acc={(tot_tok_correct / tot_tok * 100):.1f}%"
                 )
-                for q, gold_slice, pred_slice in samples_to_print:
+                for q, gold_toks, pred_toks, matches, token_losses in samples_to_print:
+                    gold_line = " ".join(gold_toks)
+                    pred_line = " ".join(pred_toks)
+                    match_line = " ".join(["✓" if m else "✗" for m in matches])
+                    loss_line  = " ".join(token_losses)
                     print("\nQ:", q)
-                    print("Gold slice:", gold_slice)
-                    print("Pred slice:", pred_slice)
+                    print("Gold slice tokens:", gold_line)
+                    print("Pred slice tokens:", pred_line)
+                    print("Match per token    :", match_line)
+                    print("CE per token       :", loss_line)
                     print("-" * 80)
 
     # --------------------------------------------------------------
@@ -419,11 +446,14 @@ def main():
         tok.convert_tokens_to_ids(DIAG_END_TOK),
         slice_index=args.slice_index,
         max_examples=100,
-        eval_steps=100,
+        eval_steps=20,
     )
 
+    train_mon = TrainMonitor(train_dset, tok, print_every=500, n_examples=2)
+
     # ── model ────────────────────────────────────────────────────────
-    model = GPTDiag.from_pretrained(args.model)
+    model_name_or_path = args.resume if args.resume else args.model
+    model = GPTDiag.from_pretrained(model_name_or_path)
     model.resize_token_embeddings(len(tok))
 
     # ── Trainer ──────────────────────────────────────────────────────
@@ -445,10 +475,60 @@ def main():
         args=targs,
         train_dataset=train_dset,
         data_collator=lambda b: collate(b, pad_id=pad_id, tok=tok, slice_index=args.slice_index),
-        callbacks=[eval_cb]
+        callbacks=[eval_cb, train_mon]
     )
     trainer.train(resume_from_checkpoint=args.resume)
     trainer.save_model()
+
+# ────────────────────────────────────────────────────────────────────
+# 7b  Training-time debug callback (token-level CE print)           
+# ────────────────────────────────────────────────────────────────────
+
+
+class TrainMonitor(TrainerCallback):
+    """Print a few training examples with per-token CE to compare with
+    evaluation behaviour.  Activated every ``print_every`` steps."""
+
+    def __init__(self, train_dataset, tok, print_every: int = 500, n_examples: int = 2):
+        self.train_ds   = train_dataset
+        self.tok        = tok
+        self.print_every= print_every
+        self.n_examples = n_examples
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None or "loss" not in logs:
+            return
+        if state.global_step == 0 or state.global_step % self.print_every != 0:
+            return
+
+        model  = kwargs["model"].eval()
+        device = next(model.parameters()).device
+
+        import random
+
+        print("\n[TRAIN DEBUG] Token-level CE on training examples (step", state.global_step, ")")
+        for _ in range(self.n_examples):
+            ex  = random.choice(self.train_ds)
+            inp = ex["input_ids"].unsqueeze(0).to(device)
+            slc = ex["diag_slice"].unsqueeze(0).to(device)
+            with torch.no_grad():
+                logits = model(input_ids=inp, diag_slice=slc).logits[0]
+
+            d0, d1 = ex["diag_slice"].tolist()
+            gold_ids = ex["labels"][d0:d1].to(device)
+            pred_ids = logits.argmax(-1)[d0:d1]
+            losses   = F.cross_entropy(logits[d0:d1], gold_ids, reduction="none")
+
+            gold_toks = self.tok.convert_ids_to_tokens(gold_ids.tolist())
+            pred_toks = self.tok.convert_ids_to_tokens(pred_ids.tolist())
+            match     = ["✓" if g==p else "✗" for g,p in zip(gold_ids.tolist(), pred_ids.tolist())]
+            loss_str  = [f"{l.item():.3f}" for l in losses]
+
+            print("Gold :", " ".join(gold_toks))
+            print("Pred :", " ".join(pred_toks))
+            print("Match:", " ".join(match))
+            print("CE   :", " ".join(loss_str))
+            print("-"*80)
 
 if __name__ == "__main__":
     main()
